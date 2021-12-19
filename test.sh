@@ -58,7 +58,7 @@ upload_proxy() {
 
 }
 gen_data() {
-    seq 80001 80150 | while read port; do
+    seq 10001 10150 | while read port; do
         echo "usr$(random)/pass$(random)/$IP4/$port/$(gen64 $IP6)"
     done
 }
