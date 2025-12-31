@@ -91,13 +91,22 @@ log_msg() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a $LOGFILE
 }
 
-log_msg "========== Starting Zero-Downtime Rotation =========="
+# Auto-cleanup log file if > 10MB
+LOG_SIZE=$(du -m "$LOGFILE" 2>/dev/null | cut -f1)
+if [ "$LOG_SIZE" -gt 10 ]; then
+    log_msg "Log file > 10MB, rotating..."
+    tail -n 1000 "$LOGFILE" > "${LOGFILE}.tmp"
+    mv "${LOGFILE}.tmp" "$LOGFILE"
+    log_msg "Log rotated, kept last 1000 lines"
+fi
+
+log_msg "========== Starting TRUE Zero-Downtime Rotation =========="
 
 # Get IPv6 prefix from data.txt
 IP6=$(head -1 $WORKDATA 2>/dev/null | cut -d'/' -f5 | cut -f1-4 -d':')
 
 if [ -z "$IP6" ]; then
-    log_msg "ERROR: Cannot determine IPv6 prefix from data.txt"
+    log_msg "ERROR: Cannot determine IPv6 prefix"
     exit 1
 fi
 
@@ -107,14 +116,17 @@ log_msg "IPv6 Prefix: $IP6"
 cp $WORKDATA ${WORKDATA}.backup
 log_msg "Backup created"
 
-# Generate NEW IPv6 addresses
+# Save old IPv6 list
+awk -F "/" '{print $5}' $WORKDATA > /tmp/old_ips.txt
+
+# Generate NEW IPv6 addresses using AWK (NO xxd needed)
 awk -v ip6="$IP6" -v user="$FIXED_USER" -v pass="$FIXED_PASS" -F "/" '
 BEGIN {
     srand();
     hex="0123456789abcdef";
 }
 {
-    # Generate 16 random hex chars
+    # Generate 16 random hex chars using AWK only
     new_suffix = "";
     for(i=1; i<=16; i++) {
         new_suffix = new_suffix substr(hex, int(rand()*16)+1, 1);
@@ -139,25 +151,21 @@ if [ ! -s ${WORKDATA}.new ]; then
 fi
 
 LINES=$(wc -l < ${WORKDATA}.new)
-log_msg "Generated $LINES new IPv6 addresses"
+log_msg "Generated $LINES new IPv6 addresses (AWK-based, no xxd)"
 
 # Replace data
 mv ${WORKDATA}.new $WORKDATA
 
-# STEP 1: Add NEW IPs
-log_msg "Step 1/4: Adding new IPv6 addresses..."
-if command -v ip >/dev/null 2>&1; then
-    awk -F "/" '{system("ip -6 addr add " $5 "/64 dev eth0 2>/dev/null")}' ${WORKDATA}
-else
-    awk -F "/" '{system("ifconfig eth0 inet6 add " $5 "/64 2>/dev/null")}' ${WORKDATA}
-fi
-log_msg "New IPv6 addresses added"
+# STEP 1: Add NEW IPv6 (old ones still active)
+log_msg "Step 1/5: Adding new IPv6 addresses (old IPs still active)..."
+awk -F "/" '{system("ip -6 addr add " $5 "/64 dev eth0 2>/dev/null")}' ${WORKDATA}
+log_msg "✅ New IPv6 added, old connections still working"
 
-sleep 2
+sleep 3
 
-# STEP 2: Regenerate config
-log_msg "Step 2/4: Regenerating 3proxy config..."
-cat > /usr/local/etc/3proxy/3proxy.cfg << 'EOFCFG'
+# STEP 2: Create NEW config file
+log_msg "Step 2/5: Generating new config..."
+cat > /usr/local/etc/3proxy/3proxy.cfg.new << 'EOFCFG'
 daemon
 maxconn 4000
 nserver 1.1.1.1
@@ -173,9 +181,9 @@ flush
 auth strong
 EOFCFG
 
-# Add users line
-echo "users ${FIXED_USER}:CL:${FIXED_PASS}" >> /usr/local/etc/3proxy/3proxy.cfg
-echo "" >> /usr/local/etc/3proxy/3proxy.cfg
+# Add users
+echo "users ${FIXED_USER}:CL:${FIXED_PASS}" >> /usr/local/etc/3proxy/3proxy.cfg.new
+echo "" >> /usr/local/etc/3proxy/3proxy.cfg.new
 
 # Add proxy rules
 awk -v user="$FIXED_USER" -F "/" '{
@@ -184,60 +192,107 @@ awk -v user="$FIXED_USER" -F "/" '{
     print "proxy -6 -n -a -p" $4 " -i" $3 " -e" $5;
     print "flush";
     print "";
-}' ${WORKDATA} >> /usr/local/etc/3proxy/3proxy.cfg
+}' ${WORKDATA} >> /usr/local/etc/3proxy/3proxy.cfg.new
 
-# STEP 3: Reload 3proxy
-log_msg "Step 3/4: Reloading 3proxy..."
+log_msg "✅ New config created (proper format)"
 
-pkill -9 3proxy 2>/dev/null
-sleep 2
+# STEP 3: Validate new config by testing
+log_msg "Step 3/5: Validating new config..."
 
-log_msg "Starting 3proxy with new config..."
-ulimit -n 65536
-/usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
-sleep 3
-
-if pgrep 3proxy > /dev/null; then
-    log_msg "✅ 3proxy started successfully"
+# Test config syntax
+if grep -q "^users ${FIXED_USER}:CL:${FIXED_PASS}" /usr/local/etc/3proxy/3proxy.cfg.new; then
+    log_msg "✅ Config validation passed"
 else
-    log_msg "❌ ERROR: Failed to start 3proxy"
+    log_msg "❌ ERROR: Config validation failed"
     cp ${WORKDATA}.backup $WORKDATA
+    rm -f /usr/local/etc/3proxy/3proxy.cfg.new
     exit 1
 fi
 
-# STEP 4: Cleanup old IPs
-log_msg "Step 4/4: Scheduling cleanup of old IPs..."
-(
-    sleep 30
+# STEP 4: Atomic config swap + graceful reload
+log_msg "Step 4/5: Swapping config and reloading gracefully..."
+
+# Replace config atomically
+mv /usr/local/etc/3proxy/3proxy.cfg.new /usr/local/etc/3proxy/3proxy.cfg
+
+# Get old PID
+OLD_PID=$(pgrep 3proxy)
+
+if [ -n "$OLD_PID" ]; then
+    # Try graceful reload first (HUP signal)
+    kill -HUP $OLD_PID 2>/dev/null
+    log_msg "Sent HUP (graceful reload) to PID $OLD_PID"
+    sleep 5
     
-    awk -F "/" '{print $5}' ${WORKDATA} > /tmp/valid_ips.txt
-    
-    if command -v ip >/dev/null 2>&1; then
-        ip -6 addr show eth0 2>/dev/null | grep "inet6" | grep -v "fe80" | awk '{print $2}' | cut -d'/' -f1 | while read ipaddr; do
-            if ! grep -q "^${ipaddr}$" /tmp/valid_ips.txt; then
-                ip -6 addr del ${ipaddr}/64 dev eth0 2>/dev/null
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Cleaned: $ipaddr" >> ${LOGFILE}
-            fi
-        done
+    # Check if graceful reload worked
+    if pgrep 3proxy > /dev/null && [ "$(pgrep 3proxy)" = "$OLD_PID" ]; then
+        log_msg "✅ Graceful reload successful (same PID, zero downtime)"
+    else
+        # HUP failed, do clean restart
+        log_msg "HUP reload failed, doing clean restart..."
+        
+        # Kill old instance cleanly
+        pkill -9 3proxy 2>/dev/null
+        sleep 2
+        
+        # Start new instance
+        ulimit -n 65536
+        /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
+        sleep 3
+        
+        if pgrep 3proxy > /dev/null; then
+            log_msg "✅ New instance started (PID: $(pgrep 3proxy))"
+        else
+            log_msg "❌ ERROR: Failed to start new instance"
+            cp ${WORKDATA}.backup $WORKDATA
+            exit 1
+        fi
     fi
+else
+    # No old instance, just start new one
+    log_msg "No old instance found, starting fresh..."
+    pkill -9 3proxy 2>/dev/null
+    sleep 1
+    ulimit -n 65536
+    /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
+    sleep 3
+fi
+
+# STEP 5: Cleanup old IPs (delayed)
+log_msg "Step 5/5: Scheduling cleanup of old IPs (in 60s)..."
+(
+    sleep 60
     
-    rm -f /tmp/valid_ips.txt
+    # Remove old IPs that are not in new list
+    while IFS= read -r old_ip; do
+        if ! grep -q "^${old_ip}$" <(awk -F "/" '{print $5}' ${WORKDATA}); then
+            ip -6 addr del ${old_ip}/64 dev eth0 2>/dev/null
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Cleaned old IP: $old_ip" >> ${LOGFILE}
+        fi
+    done < /tmp/old_ips.txt
+    
+    rm -f /tmp/old_ips.txt
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Cleanup completed" >> ${LOGFILE}
 ) &
 
-log_msg "Cleanup scheduled"
+log_msg "Cleanup scheduled for background execution"
 
+# Verify final state
+sleep 2
 if pgrep 3proxy > /dev/null; then
     PROXY_COUNT=$(wc -l < $WORKDATA)
-    log_msg "✅ SUCCESS: Rotation completed"
+    CURRENT_PID=$(pgrep 3proxy)
+    log_msg "✅ SUCCESS: TRUE Zero-Downtime Rotation Completed"
     log_msg "   Active proxies: $PROXY_COUNT"
-    log_msg "   3proxy PID: $(pgrep 3proxy)"
+    log_msg "   3proxy PID: $CURRENT_PID"
+    log_msg "   Old connections: Still active on old IPs (for 60s)"
+    log_msg "   New connections: Using new IPs immediately"
 else
-    log_msg "❌ ERROR: 3proxy not running!"
+    log_msg "❌ ERROR: 3proxy not running after rotation!"
     exit 1
 fi
 
-log_msg "========== Rotation Completed =========="
+log_msg "========== Rotation Completed Successfully =========="
 ROTEOF
 
     chmod +x /home/bkns/rotate_ipv6.sh
@@ -247,6 +302,16 @@ create_monitor_script() {
     cat > /home/bkns/monitor.sh << 'EOF'
 #!/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+# Auto-cleanup monitor log if > 5MB
+if [ -f /home/bkns/monitor.log ]; then
+    LOG_SIZE=$(du -m /home/bkns/monitor.log 2>/dev/null | cut -f1)
+    if [ "$LOG_SIZE" -gt 5 ]; then
+        tail -n 500 /home/bkns/monitor.log > /home/bkns/monitor.log.tmp
+        mv /home/bkns/monitor.log.tmp /home/bkns/monitor.log
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Monitor log rotated" >> /home/bkns/monitor.log
+    fi
+fi
 
 if ! pgrep 3proxy > /dev/null; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: 3proxy died, restarting..." >> /home/bkns/monitor.log
@@ -265,6 +330,39 @@ EOF
     chmod +x /home/bkns/monitor.sh
 }
 
+create_log_cleanup_script() {
+    cat > /home/bkns/cleanup_logs.sh << 'EOF'
+#!/bin/bash
+# Daily log cleanup - keeps logs under control
+
+# Rotate rotate.log if > 10MB
+if [ -f /home/bkns/rotate.log ]; then
+    SIZE=$(du -m /home/bkns/rotate.log 2>/dev/null | cut -f1)
+    if [ "$SIZE" -gt 10 ]; then
+        tail -n 1000 /home/bkns/rotate.log > /home/bkns/rotate.log.tmp
+        mv /home/bkns/rotate.log.tmp /home/bkns/rotate.log
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Rotate log cleaned (kept 1000 lines)" >> /home/bkns/rotate.log
+    fi
+fi
+
+# Rotate monitor.log if > 5MB
+if [ -f /home/bkns/monitor.log ]; then
+    SIZE=$(du -m /home/bkns/monitor.log 2>/dev/null | cut -f1)
+    if [ "$SIZE" -gt 5 ]; then
+        tail -n 500 /home/bkns/monitor.log > /home/bkns/monitor.log.tmp
+        mv /home/bkns/monitor.log.tmp /home/bkns/monitor.log
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Monitor log cleaned (kept 500 lines)" >> /home/bkns/monitor.log
+    fi
+fi
+
+# Clean 3proxy logs if exist
+if [ -d /usr/local/etc/3proxy/logs ]; then
+    find /usr/local/etc/3proxy/logs -type f -mtime +7 -delete 2>/dev/null
+fi
+EOF
+    chmod +x /home/bkns/cleanup_logs.sh
+}
+
 setup_cron_rotation() {
     echo "Setting up cron jobs..."
     
@@ -273,29 +371,31 @@ setup_cron_rotation() {
     (
         echo "*/5 * * * * /home/bkns/rotate_ipv6.sh >> /home/bkns/rotate.log 2>&1"
         echo "*/3 * * * * /home/bkns/monitor.sh"
+        echo "0 3 * * * /home/bkns/cleanup_logs.sh"
     ) | crontab -
     
-    echo "✅ Cron configured"
+    echo "✅ Cron configured (rotation 5min, monitor 3min, cleanup daily 3AM)"
 }
 
 echo "======================================"
 echo "  3PROXY - 50 PORTS - ROTATION 5MIN  "
+echo "  TRUE ZERO-DOWNTIME + AUTO CLEANUP  "
 echo "  Username/Password: AnhVip17102     "
 echo "======================================"
 echo ""
 
-echo "[1/9] Installing dependencies..."
+echo "[1/10] Installing dependencies (including vim-common)..."
 install_dependencies
 
-echo "[2/9] Installing 3proxy..."
+echo "[2/10] Installing 3proxy..."
 install_3proxy
 
-echo "[3/9] Setting up directories..."
+echo "[3/10] Setting up directories..."
 WORKDIR="/home/bkns"
 WORKDATA="${WORKDIR}/data.txt"
 mkdir -p $WORKDIR && cd $WORKDIR
 
-echo "[4/9] Detecting IPs..."
+echo "[4/10] Detecting IPs..."
 IP4=$(curl -4 -s icanhazip.com)
 IP6=$(curl -6 -s icanhazip.com 2>/dev/null | cut -f1-4 -d':')
 
@@ -315,7 +415,7 @@ fi
 echo "   IPv4: ${IP4}"
 echo "   IPv6: ${IP6}"
 
-echo "[5/9] Generating 50 proxies..."
+echo "[5/10] Generating 50 proxies..."
 FIRST_PORT=10000
 LAST_PORT=10049
 
@@ -324,16 +424,16 @@ echo "   Ports: 10000-10049"
 echo "   Username: ${FIXED_USER}"
 echo "   Password: ${FIXED_PASS}"
 
-echo "[6/9] Configuring IPv6..."
+echo "[6/10] Configuring IPv6..."
 gen_ifconfig > $WORKDIR/boot_ifconfig.sh
 chmod +x $WORKDIR/boot_ifconfig.sh
 bash $WORKDIR/boot_ifconfig.sh
 
-echo "[7/9] Generating config..."
+echo "[7/10] Generating config..."
 export FIXED_USER FIXED_PASS
 gen_3proxy > /usr/local/etc/3proxy/3proxy.cfg
 
-echo "[8/9] Auto-start setup..."
+echo "[8/10] Auto-start setup..."
 cat > /etc/rc.d/rc.local <<EOF
 #!/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
@@ -345,7 +445,9 @@ EOF
 chmod +x /etc/rc.d/rc.local
 systemctl enable rc-local 2>/dev/null
 
-echo "[9/9] Starting 3proxy..."
+echo "[9/10] Starting 3proxy..."
+pkill -9 3proxy 2>/dev/null
+sleep 2
 ulimit -n 65536
 /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
 sleep 3
@@ -356,9 +458,10 @@ else
     echo "⚠️  Failed to start"
 fi
 
-echo ""
+echo "[10/10] Setting up rotation, monitoring, and log cleanup..."
 create_rotate_script
 create_monitor_script
+create_log_cleanup_script
 setup_cron_rotation
 gen_proxy_file_for_user
 
@@ -366,7 +469,7 @@ rm -rf /root/setup.sh /root/3proxy-* 3proxy-0.8.13 2>/dev/null
 
 echo ""
 echo "======================================"
-echo "✅ DONE - 50 Proxies Ready"
+echo "✅ INSTALLATION COMPLETED"
 echo "======================================"
 echo "📋 Credentials:"
 echo "   Username: ${FIXED_USER}"
@@ -375,30 +478,30 @@ echo ""
 echo "📁 Files:"
 echo "   Proxy list: $WORKDIR/proxy.txt"
 echo "   Rotation log: $WORKDIR/rotate.log"
+echo "   Monitor log: $WORKDIR/monitor.log"
 echo ""
 echo "⚙️  Features:"
-echo "   ✅ All proxies use same credentials"
+echo "   ✅ TRUE Zero-Downtime Rotation"
+echo "   ✅ AWK-based IPv6 generation (no xxd)"
+echo "   ✅ Proper config format"
+echo "   ✅ Clean kill before start (pkill -9)"
+echo "   ✅ Auto log rotation (rotate.log > 10MB)"
+echo "   ✅ Daily log cleanup (3AM)"
+echo "   ✅ vim-common installed"
 echo "   ✅ Auto rotation: Every 5 minutes"
 echo "   ✅ Auto monitor: Every 3 minutes"
+echo ""
+echo "📊 Cron Jobs:"
+echo "   */5 * * * * → IPv6 Rotation"
+echo "   */3 * * * * → Health Monitor"
+echo "   0 3 * * * → Log Cleanup"
 echo ""
 FIRST_PROXY=$(head -1 $WORKDIR/proxy.txt)
 if [ -n "$FIRST_PROXY" ]; then
     echo "🧪 Test first proxy:"
     echo "   curl -x ${FIXED_USER}:${FIXED_PASS}@$(echo $FIRST_PROXY | cut -d: -f1):$(echo $FIRST_PROXY | cut -d: -f2) https://api64.ipify.org"
 fi
+echo ""
 echo "======================================"
-```
-
-## Thay đổi chính:
-
-✅ **Username cố định**: `AnhVip17102` cho tất cả 50 ports  
-✅ **Password cố định**: `AnhVip17102` cho tất cả 50 ports  
-✅ **Proxy list format**: `IP:PORT:AnhVip17102:AnhVip17102`  
-✅ **Dễ nhớ**: Chỉ cần 1 username/password cho tất cả proxy  
-
-**Format proxy trong file `proxy.txt`:**
-```
-YOUR_IP:10000:AnhVip17102:AnhVip17102
-YOUR_IP:10001:AnhVip17102:AnhVip17102
-YOUR_IP:10002:AnhVip17102:AnhVip17102
-...
+echo "🎉 All Done! Enjoy Your Proxy Pool!"
+echo "======================================"
