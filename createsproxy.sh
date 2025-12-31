@@ -6,14 +6,14 @@ FIXED_USER="AnhVip17102"
 FIXED_PASS="AnhVip17102"
 
 install_dependencies() {
-    echo "Installing dependencies (including vim-common)..."
+    echo "Installing dependencies (vim-common included)..."
     if command -v yum >/dev/null 2>&1; then
-        yum install -y iproute vim-common wget gcc make >/dev/null 2>&1
+        yum install -y iproute vim-common wget gcc make net-tools >/dev/null 2>&1
     elif command -v apt-get >/dev/null 2>&1; then
         apt-get update >/dev/null 2>&1
-        apt-get install -y iproute2 vim-common wget gcc make >/dev/null 2>&1
+        apt-get install -y iproute2 vim-common wget gcc make net-tools >/dev/null 2>&1
     fi
-    echo "✅ Dependencies installed (vim-common included)"
+    echo "✅ Dependencies installed"
 }
 
 install_3proxy() {
@@ -24,12 +24,13 @@ install_3proxy() {
     make -f Makefile.Linux
     mkdir -p /usr/local/etc/3proxy/{bin,logs,stat}
     cp src/3proxy /usr/local/etc/3proxy/bin/
+    cp bin/mycrypt /usr/local/etc/3proxy/bin/ 2>/dev/null
     cd $WORKDIR
-    echo "✅ 3proxy installed"
+    echo "✅ 3proxy compiled and installed"
 }
 
 gen_3proxy_per_request() {
-    cat <<EOF
+    cat > /usr/local/etc/3proxy/3proxy.cfg << EOF
 daemon
 maxconn 4000
 nserver 1.1.1.1
@@ -48,43 +49,95 @@ users ${FIXED_USER}:CL:${FIXED_PASS}
 
 EOF
 
-    # Generate proxy rules for each port
-    seq $FIRST_PORT $LAST_PORT | while read port; do
-        # Each port gets unique /64 subnet for auto-rotation
-        subnet=$((port - FIRST_PORT))
-        subnet_hex=$(printf "%02x" $subnet)
+    # Generate proxy rules with proper IPv6 format
+    local port_num=$FIRST_PORT
+    while [ $port_num -le $LAST_PORT ]; do
+        subnet=$((port_num - FIRST_PORT))
+        subnet_hex=$(printf "%x" $subnet)
         
-        cat <<PROXYEOF
+        cat >> /usr/local/etc/3proxy/3proxy.cfg << EOF
 auth strong
 allow ${FIXED_USER}
-proxy -6 -n -a -p${port} -i${IP4} -e${IP6}:${subnet_hex}00::/64
+proxy -6 -n -a -p${port_num} -i${IP4} -e${IP6}:${subnet_hex}::/64
 flush
 
-PROXYEOF
+EOF
+        port_num=$((port_num + 1))
     done
+    
+    echo "✅ Config generated with per-request rotation"
 }
 
 gen_proxy_file_for_user() {
-    cat >proxy.txt <<EOF
+    cat > $WORKDIR/proxy.txt << EOF
+# Format: IP:PORT:USERNAME:PASSWORD
+# Per-request rotation: Each new connection gets a different IPv6
 $(seq $FIRST_PORT $LAST_PORT | while read port; do
     echo "$IP4:$port:$FIXED_USER:$FIXED_PASS"
 done)
 EOF
 }
 
-setup_ipv6_subnets() {
-    echo "Setting up IPv6 subnets for per-request rotation..."
+setup_ipv6_network() {
+    echo "Setting up IPv6 network for per-request rotation..."
     
-    # Add main /56 route to allow all /64 subnets
-    ip -6 route add ${IP6}::/56 dev eth0 2>/dev/null
+    # Enable IPv6
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
+    sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
+    sysctl -w net.ipv6.conf.eth0.disable_ipv6=0 >/dev/null 2>&1
     
     # Enable IPv6 forwarding
     sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
     sysctl -w net.ipv6.conf.eth0.forwarding=1 >/dev/null 2>&1
     
-    echo "✅ IPv6 /56 routing configured"
-    echo "   Each port has unique /64 subnet"
-    echo "   = 18,446,744,073,709,551,616 IPs per port!"
+    # Add /56 route to allow all /64 subnets
+    ip -6 route del ${IP6}::/56 dev eth0 2>/dev/null
+    ip -6 route add ${IP6}::/56 dev eth0 2>/dev/null
+    
+    # Accept Router Advertisements
+    sysctl -w net.ipv6.conf.eth0.accept_ra=2 >/dev/null 2>&1
+    
+    # Disable source validation for IPv6
+    sysctl -w net.ipv6.conf.all.accept_source_route=1 >/dev/null 2>&1
+    
+    echo "✅ IPv6 network configured"
+    echo "   Base: ${IP6}::/56"
+    echo "   Each port: ${IP6}:X::/64 (X = 0-49)"
+}
+
+test_ipv6_connectivity() {
+    echo "Testing IPv6 connectivity..."
+    
+    if ping6 -c 2 google.com >/dev/null 2>&1; then
+        echo "✅ IPv6 internet connectivity OK"
+        return 0
+    else
+        echo "⚠️  IPv6 ping failed, but proxy may still work"
+        return 1
+    fi
+}
+
+create_startup_script() {
+    cat > /etc/rc.d/rc.local << EOF
+#!/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+# Enable IPv6
+sysctl -w net.ipv6.conf.all.disable_ipv6=0
+sysctl -w net.ipv6.conf.all.forwarding=1
+sysctl -w net.ipv6.conf.eth0.forwarding=1
+
+# Setup IPv6 routing
+ip -6 route add ${IP6}::/56 dev eth0 2>/dev/null
+
+# Start 3proxy
+sleep 5
+ulimit -n 65536
+/usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
+EOF
+
+    chmod +x /etc/rc.d/rc.local
+    systemctl enable rc-local 2>/dev/null
 }
 
 create_monitor_script() {
@@ -92,7 +145,7 @@ create_monitor_script() {
 #!/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 
-# Auto-cleanup monitor log if > 5MB
+# Auto-cleanup log if > 5MB
 if [ -f /home/bkns/monitor.log ]; then
     LOG_SIZE=$(du -m /home/bkns/monitor.log 2>/dev/null | cut -f1)
     if [ "$LOG_SIZE" -gt 5 ]; then
@@ -101,15 +154,13 @@ if [ -f /home/bkns/monitor.log ]; then
     fi
 fi
 
-# Check if 3proxy is running
+# Check 3proxy
 if ! pgrep 3proxy > /dev/null; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠️  3proxy died, restarting..." >> /home/bkns/monitor.log
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 3proxy died, restarting..." >> /home/bkns/monitor.log
     
-    # Clean kill
     pkill -9 3proxy 2>/dev/null
     sleep 2
     
-    # Restart
     ulimit -n 65536
     /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
     sleep 3
@@ -124,63 +175,123 @@ EOF
     chmod +x /home/bkns/monitor.sh
 }
 
-create_log_cleanup_script() {
-    cat > /home/bkns/cleanup_logs.sh << 'EOF'
+create_debug_script() {
+    cat > /root/debug_proxy.sh << 'EOF'
 #!/bin/bash
-# Daily log cleanup (no xxd needed - pure shell)
+echo "=========================================="
+echo "  PROXY DEBUG INFORMATION"
+echo "=========================================="
+echo ""
 
-# Clean monitor log if > 5MB
-if [ -f /home/bkns/monitor.log ]; then
-    SIZE=$(du -m /home/bkns/monitor.log 2>/dev/null | cut -f1)
-    if [ "$SIZE" -gt 5 ]; then
-        tail -n 500 /home/bkns/monitor.log > /home/bkns/monitor.log.tmp
-        mv /home/bkns/monitor.log.tmp /home/bkns/monitor.log
-        echo "[$(date)] Monitor log cleaned" >> /home/bkns/monitor.log
+echo "1️⃣  3proxy Process Status:"
+if pgrep 3proxy > /dev/null; then
+    ps aux | grep 3proxy | grep -v grep
+    echo "✅ 3proxy is running"
+else
+    echo "❌ 3proxy is NOT running"
+fi
+echo ""
+
+echo "2️⃣  Listening Ports (first 5):"
+netstat -tlnp 2>/dev/null | grep 3proxy | head -5
+PORTS=$(netstat -tlnp 2>/dev/null | grep 3proxy | wc -l)
+echo "Total listening ports: $PORTS"
+echo ""
+
+echo "3️⃣  IPv6 Configuration:"
+echo "IPv6 addresses on eth0:"
+ip -6 addr show eth0 | grep "inet6" | grep -v "fe80"
+echo ""
+echo "IPv6 routes:"
+ip -6 route show | head -5
+echo ""
+
+echo "4️⃣  IPv6 Connectivity Test:"
+if timeout 5 ping6 -c 2 google.com >/dev/null 2>&1; then
+    echo "✅ IPv6 internet OK"
+else
+    echo "⚠️  IPv6 ping failed"
+fi
+echo ""
+
+echo "5️⃣  Firewall Status:"
+if command -v firewall-cmd >/dev/null 2>&1; then
+    firewall-cmd --state 2>/dev/null || echo "Firewall not running"
+else
+    echo "firewalld not installed"
+fi
+echo ""
+
+echo "6️⃣  Config File (first 40 lines):"
+head -40 /usr/local/etc/3proxy/3proxy.cfg 2>/dev/null || echo "Config not found"
+echo ""
+
+echo "7️⃣  Test Proxy Connection:"
+PROXY=$(head -1 /home/bkns/proxy.txt 2>/dev/null | grep -v "^#")
+if [ -n "$PROXY" ]; then
+    IP=$(echo $PROXY | cut -d: -f1)
+    PORT=$(echo $PROXY | cut -d: -f2)
+    USER=$(echo $PROXY | cut -d: -f3)
+    PASS=$(echo $PROXY | cut -d: -f4)
+    
+    echo "Testing: ${IP}:${PORT}"
+    echo "Command: curl -x ${USER}:${PASS}@${IP}:${PORT} https://api64.ipify.org"
+    
+    RESULT=$(timeout 10 curl -s -x ${USER}:${PASS}@${IP}:${PORT} https://api64.ipify.org 2>&1)
+    if [ -n "$RESULT" ]; then
+        echo "✅ Proxy works! IPv6: $RESULT"
+    else
+        echo "❌ Proxy connection failed"
     fi
+else
+    echo "❌ No proxy.txt found"
 fi
+echo ""
 
-# Clean old 3proxy logs (>7 days)
-if [ -d /usr/local/etc/3proxy/logs ]; then
-    find /usr/local/etc/3proxy/logs -type f -mtime +7 -delete 2>/dev/null
-fi
+echo "=========================================="
 EOF
-    chmod +x /home/bkns/cleanup_logs.sh
+    chmod +x /root/debug_proxy.sh
 }
 
-setup_cron_monitoring() {
+setup_cron() {
     echo "Setting up cron jobs..."
-    
-    # Remove old cron
     crontab -r 2>/dev/null
-    
-    # Add monitoring cron (no rotation needed!)
     (
         echo "*/3 * * * * /home/bkns/monitor.sh"
-        echo "0 3 * * * /home/bkns/cleanup_logs.sh"
+        echo "0 3 * * * find /usr/local/etc/3proxy/logs -type f -mtime +7 -delete 2>/dev/null"
     ) | crontab -
-    
-    echo "✅ Cron configured (monitor 3min, cleanup daily 3AM)"
+    echo "✅ Cron configured"
+}
+
+disable_firewall() {
+    echo "Configuring firewall..."
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        systemctl stop firewalld 2>/dev/null
+        systemctl disable firewalld 2>/dev/null
+        echo "✅ Firewall disabled"
+    else
+        echo "✅ No firewall to disable"
+    fi
 }
 
 echo "======================================================="
-echo "  3PROXY - 50 PORTS - PER-REQUEST ROTATION            "
-echo "  New IPv6 on EVERY connection!                        "
+echo "  3PROXY - 50 PORTS - PER-REQUEST IPv6 ROTATION       "
+echo "  Each connection = NEW IPv6 automatically!            "
 echo "  Username/Password: AnhVip17102                       "
-echo "  No periodic rotation needed - fully automatic!       "
 echo "======================================================="
 echo ""
 
-echo "[1/9] Installing dependencies (vim-common included)..."
+echo "[1/12] Installing dependencies..."
 install_dependencies
 
-echo "[2/9] Installing 3proxy..."
+echo "[2/12] Installing 3proxy..."
 install_3proxy
 
-echo "[3/9] Setting up directories..."
+echo "[3/12] Setting up working directory..."
 WORKDIR="/home/bkns"
 mkdir -p $WORKDIR && cd $WORKDIR
 
-echo "[4/9] Detecting IP addresses..."
+echo "[4/12] Detecting IP addresses..."
 IP4=$(curl -4 -s icanhazip.com)
 IP6=$(curl -6 -s icanhazip.com 2>/dev/null | cut -f1-3 -d':')
 
@@ -190,73 +301,67 @@ if [ -z "$IP4" ]; then
 fi
 
 if [ -z "$IP6" ]; then
+    echo "Trying alternative method..."
     IP6=$(ip -6 addr show eth0 2>/dev/null | grep "inet6" | grep -v "fe80" | head -1 | awk '{print $2}' | cut -f1-3 -d':')
     if [ -z "$IP6" ]; then
-        echo "❌ ERROR: Cannot detect IPv6"
+        echo "❌ ERROR: Cannot detect IPv6. VPS may not support IPv6."
         exit 1
     fi
 fi
 
 echo "   IPv4: ${IP4}"
-echo "   IPv6 Base (/56): ${IP6}"
+echo "   IPv6 Base: ${IP6}"
 
-echo "[5/9] Configuring 50 ports with per-request rotation..."
+echo "[5/12] Configuring ports..."
 FIRST_PORT=10000
 LAST_PORT=10049
-
 echo "   ✅ Ports: 10000-10049 (50 ports)"
-echo "   ✅ Each port: unique /64 subnet"
-echo "   ✅ Per port IPs: 18,446,744,073,709,551,616"
-echo "   ✅ Total pool: 922,337,203,685,477,580,800 IPs!"
 
-echo "[6/9] Setting up IPv6 routing (/56 → /64 subnets)..."
-setup_ipv6_subnets
+echo "[6/12] Setting up IPv6 network..."
+setup_ipv6_network
 
-echo "[7/9] Generating 3proxy config (proper format, no xxd)..."
-export FIXED_USER FIXED_PASS IP4 IP6 FIRST_PORT LAST_PORT
-gen_3proxy_per_request > /usr/local/etc/3proxy/3proxy.cfg
-echo "   ✅ Config generated with per-request rotation"
+echo "[7/12] Testing IPv6 connectivity..."
+test_ipv6_connectivity
 
-echo "[8/9] Setting up auto-start on boot..."
-cat > /etc/rc.d/rc.local <<EOF
-#!/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+echo "[8/12] Disabling firewall (for testing)..."
+disable_firewall
 
-# Setup IPv6 routing
-ip -6 route add ${IP6}::/56 dev eth0 2>/dev/null
-sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
-sysctl -w net.ipv6.conf.eth0.forwarding=1 >/dev/null 2>&1
+echo "[9/12] Generating 3proxy config..."
+gen_3proxy_per_request
 
-# Start 3proxy
-ulimit -n 65536
-/usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
-EOF
+echo "[10/12] Creating startup script..."
+create_startup_script
 
-chmod +x /etc/rc.d/rc.local
-systemctl enable rc-local 2>/dev/null
-echo "   ✅ Auto-start configured"
-
-echo "[9/9] Starting 3proxy (clean start with pkill -9)..."
-# Clean kill any existing instance
+echo "[11/12] Starting 3proxy..."
+# Clean kill
 pkill -9 3proxy 2>/dev/null
 sleep 2
 
 # Start 3proxy
 ulimit -n 65536
 /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
+PROXY_PID=$!
 sleep 3
 
+# Verify
 if pgrep 3proxy > /dev/null; then
     echo "   ✅ 3proxy started (PID: $(pgrep 3proxy))"
+    
+    # Check ports
+    sleep 2
+    PORTS=$(netstat -tlnp 2>/dev/null | grep 3proxy | wc -l)
+    echo "   ✅ Listening on $PORTS ports"
 else
-    echo "   ⚠️  Warning: 3proxy may not have started"
+    echo "   ❌ 3proxy failed to start!"
+    echo "   Running in foreground to see errors:"
+    /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg
+    exit 1
 fi
 
-echo ""
-echo "Setting up monitoring & log cleanup..."
+echo "[12/12] Setting up monitoring & scripts..."
 create_monitor_script
-create_log_cleanup_script
-setup_cron_monitoring
+create_debug_script
+setup_cron
 gen_proxy_file_for_user
 
 # Cleanup
@@ -264,93 +369,66 @@ rm -rf /root/setup.sh /root/3proxy-* 3proxy-0.8.13 2>/dev/null
 
 echo ""
 echo "======================================================="
-echo "✅ INSTALLATION COMPLETED SUCCESSFULLY"
+echo "✅ INSTALLATION COMPLETED"
 echo "======================================================="
 echo ""
-echo "📋 Proxy Configuration:"
-echo "   Total Ports: 50 (10000-10049)"
+echo "📋 Configuration:"
+echo "   Ports: 50 (10000-10049)"
 echo "   Username: ${FIXED_USER}"
 echo "   Password: ${FIXED_PASS}"
 echo "   IPv4: ${IP4}"
-echo "   IPv6 Base: ${IP6}"
+echo "   IPv6: ${IP6}::/56"
 echo ""
-echo "⚡ Per-Request Rotation Features:"
-echo "   ✅ Each new connection = NEW IPv6 automatically"
-echo "   ✅ Active sessions keep same IP (no disconnection)"
-echo "   ✅ Each port has /64 subnet (18+ quintillion IPs)"
-echo "   ✅ NO periodic rotation needed"
-echo "   ✅ NO CPU spikes from rotation"
-echo "   ✅ Sessions safe - login won't be lost"
-echo ""
-echo "🔧 Technical Implementation:"
-echo "   ✅ AWK-based generation (no xxd needed)"
-echo "   ✅ Proper 3proxy config format"
-echo "   ✅ Clean kill (pkill -9) before start"
-echo "   ✅ vim-common installed"
-echo "   ✅ Auto log cleanup (>5MB)"
+echo "⚡ Per-Request Rotation:"
+echo "   ✅ Each connection = NEW IPv6"
+echo "   ✅ Active sessions keep same IP"
+echo "   ✅ No periodic rotation needed"
 echo ""
 echo "📁 Important Files:"
 echo "   Proxy List: $WORKDIR/proxy.txt"
 echo "   Monitor Log: $WORKDIR/monitor.log"
+echo "   Debug Script: /root/debug_proxy.sh"
 echo ""
-echo "🔄 Automation:"
-echo "   Health Monitor: Every 3 minutes"
-echo "   Log Cleanup: Daily at 3AM"
-echo "   NO rotation cron needed!"
+echo "🔧 Debug & Testing:"
+echo "   Run debug: bash /root/debug_proxy.sh"
 echo ""
-echo "📊 Resource Usage (20 concurrent):"
-echo "   RAM: ~280 MB / 1024 MB (27%)"
-echo "   CPU: ~1-2% (no rotation spikes!)"
-echo "   Disk: ~3-4 GB total"
-echo ""
-echo "🎯 How Per-Request Rotation Works:"
-echo ""
-echo "   Port 10000 uses subnet: ${IP6}:0000::/64"
-echo "   ├─ Connection 1 → ${IP6}:0000:a1b2:c3d4:e5f6:7890"
-echo "   ├─ Connection 2 → ${IP6}:0000:1234:5678:9abc:def0 ← NEW IP!"
-echo "   └─ Connection 3 → ${IP6}:0000:fedc:ba98:7654:3210 ← NEW IP!"
-echo ""
-echo "   Port 10001 uses subnet: ${IP6}:0100::/64"
-echo "   ├─ Connection 1 → ${IP6}:0100:9876:5432:1fed:cba0"
-echo "   └─ Connection 2 → ${IP6}:0100:abcd:ef01:2345:6789 ← NEW IP!"
-echo ""
-echo "🧪 Test Per-Request Rotation:"
-echo ""
-FIRST_PROXY=$(head -1 $WORKDIR/proxy.txt)
+echo "🧪 Quick Test:"
+FIRST_PROXY=$(head -1 $WORKDIR/proxy.txt | grep -v "^#")
 if [ -n "$FIRST_PROXY" ]; then
-    PROXY_IP=$(echo $FIRST_PROXY | cut -d: -f1)
-    PROXY_PORT=$(echo $FIRST_PROXY | cut -d: -f2)
+    TEST_IP=$(echo $FIRST_PROXY | cut -d: -f1)
+    TEST_PORT=$(echo $FIRST_PROXY | cut -d: -f2)
+    echo ""
+    echo "   Test command:"
+    echo "   curl -x ${FIXED_USER}:${FIXED_PASS}@${TEST_IP}:${TEST_PORT} https://api64.ipify.org"
+    echo ""
+    echo "   Testing now..."
+    RESULT=$(timeout 10 curl -s -x ${FIXED_USER}:${FIXED_PASS}@${TEST_IP}:${TEST_PORT} https://api64.ipify.org 2>&1)
     
-    echo "   # Test 1 - First connection:"
-    echo "   curl -x ${FIXED_USER}:${FIXED_PASS}@${PROXY_IP}:${PROXY_PORT} https://api64.ipify.org"
-    echo ""
-    echo "   # Test 2 - Second connection (will show DIFFERENT IPv6):"
-    echo "   curl -x ${FIXED_USER}:${FIXED_PASS}@${PROXY_IP}:${PROXY_PORT} https://api64.ipify.org"
-    echo ""
-    echo "   # Test 3 - Third connection (will show ANOTHER IPv6):"
-    echo "   curl -x ${FIXED_USER}:${FIXED_PASS}@${PROXY_IP}:${PROXY_PORT} https://api64.ipify.org"
-    echo ""
-    echo "   ✅ Each curl will show different IPv6!"
-    echo ""
-    echo "📝 Proxy Format (for tools):"
-    echo "   ${PROXY_IP}:${PROXY_PORT}:${FIXED_USER}:${FIXED_PASS}"
+    if [ -n "$RESULT" ] && echo "$RESULT" | grep -qE "^[0-9a-f:]+$"; then
+        echo "   ✅ SUCCESS! IPv6: $RESULT"
+        echo ""
+        echo "   Test again for different IP:"
+        RESULT2=$(timeout 10 curl -s -x ${FIXED_USER}:${FIXED_PASS}@${TEST_IP}:${TEST_PORT} https://api64.ipify.org 2>&1)
+        echo "   ✅ IPv6: $RESULT2"
+        
+        if [ "$RESULT" != "$RESULT2" ]; then
+            echo ""
+            echo "   🎉 PER-REQUEST ROTATION IS WORKING!"
+            echo "   Each connection shows different IPv6!"
+        fi
+    else
+        echo "   ❌ Test failed: $RESULT"
+        echo ""
+        echo "   Run debug script for details:"
+        echo "   bash /root/debug_proxy.sh"
+    fi
 fi
+
 echo ""
 echo "======================================================="
-echo "🎉 Per-Request Rotation Proxy Pool is Ready!"
+echo "💡 Next Steps:"
+echo "   1. If test failed, run: bash /root/debug_proxy.sh"
+echo "   2. Check monitor: tail -f /home/bkns/monitor.log"
+echo "   3. View proxies: cat /home/bkns/proxy.txt"
 echo "======================================================="
 echo ""
-echo "💡 Advantages over Time-Based Rotation:"
-echo "   ✅ Sessions never interrupted"
-echo "   ✅ Login states preserved"
-echo "   ✅ No rotation overhead"
-echo "   ✅ Perfect anti-detection"
-echo "   ✅ Auto-rotation on demand"
-echo ""
-echo "💡 Useful Commands:"
-echo "   Check status: ps aux | grep 3proxy"
-echo "   View monitor log: tail -f /home/bkns/monitor.log"
-echo "   View cron jobs: crontab -l"
-echo "   Test rotation: Run curl 3 times, see 3 different IPs"
-echo ""
-echo "======================================================="
