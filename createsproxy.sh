@@ -349,8 +349,8 @@ echo "   IPv4: ${IP4}"
 echo "   IPv6 Prefix: ${IP6}"
 
 echo "[4/8] Generating proxy data..."
-FIRST_PORT=22000
-LAST_PORT=22100
+FIRST_PORT=22001
+LAST_PORT=22050
 TOTAL_PROXIES=$((LAST_PORT - FIRST_PORT + 1))
 
 gen_data > $WORKDIR/data.txt
