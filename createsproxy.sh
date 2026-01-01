@@ -23,7 +23,6 @@ IP6=$(head -1 $WORKDATA 2>/dev/null | cut -d'/' -f5 | cut -f1-4 -d':')
 
 cp $WORKDATA ${WORKDATA}.backup
 
-# Generate new IPs
 awk -v ip6="$IP6" -v user="$FIXED_USER" -v pass="$FIXED_PASS" -F "/" '
 BEGIN {
     srand();
@@ -46,19 +45,16 @@ BEGIN {
 
 [ ! -s ${WORKDATA}.new ] && log_msg "ERROR: Gen failed" && exit 1
 
-# Save keep list FIRST
-awk -F "/" '{print $5}' ${WORKDATA}.new | sort > /tmp/keep_ips.txt
+awk -F "/" '{print $5}' ${WORKDATA}.new > /tmp/keep_ips.txt
 KEEP_COUNT=$(wc -l < /tmp/keep_ips.txt)
 
 mv ${WORKDATA}.new $WORKDATA
 
-# Add new IPs
 log_msg "Adding new IPs..."
 awk -F "/" '{system("ip -6 addr add " $5 "/64 dev eth0 2>/dev/null")}' ${WORKDATA}
 
 sleep 2
 
-# Generate config
 cat > /usr/local/etc/3proxy/3proxy.cfg.new << 'EOFCFG'
 daemon
 maxconn 4000
@@ -76,6 +72,7 @@ auth strong
 EOFCFG
 
 echo "users ${FIXED_USER}:CL:${FIXED_PASS}" >> /usr/local/etc/3proxy/3proxy.cfg.new
+
 awk -v user="$FIXED_USER" -F "/" '{
     print "auth strong";
     print "allow " user;
@@ -85,60 +82,65 @@ awk -v user="$FIXED_USER" -F "/" '{
 
 mv /usr/local/etc/3proxy/3proxy.cfg.new /usr/local/etc/3proxy/3proxy.cfg
 
-# Reload
 OLD_PID=$(pgrep 3proxy)
 if [ -n "$OLD_PID" ]; then
     kill -HUP $OLD_PID 2>/dev/null
     sleep 5
-    [ ! -n "$(pgrep 3proxy)" ] && pkill -9 3proxy && sleep 2 && ulimit -n 65536 && /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
+    
+    if ! pgrep 3proxy > /dev/null; then
+        pkill -9 3proxy 2>/dev/null
+        sleep 2
+        ulimit -n 65536
+        /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
+        sleep 3
+    fi
 else
     ulimit -n 65536
     /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
+    sleep 3
 fi
 
-sleep 3
+[ ! -n "$(pgrep 3proxy)" ] && log_msg "ERROR: 3proxy failed" && exit 1
 
-# CLEANUP - FIXED VERSION
-log_msg "Cleanup start..."
+log_msg "Cleanup (safe method)..."
 
 BEFORE=$(ip -6 addr show eth0 | grep -c 'inet6.*scope global')
 
-# Get all current IPs
-ip -6 addr show eth0 | grep 'inet6.*scope global' | awk '{print $2}' | cut -d'/' -f1 | sort > /tmp/all_ips.txt
-
-# Find IPs to delete
-comm -23 /tmp/all_ips.txt /tmp/keep_ips.txt > /tmp/delete_ips.txt
-
-# Delete one by one
-REMOVED=0
+# Create associative array of IPs to keep
+declare -A KEEP_MAP
 while IFS= read -r ip; do
-    if ip -6 addr del ${ip}/64 dev eth0 2>/dev/null; then
-        REMOVED=$((REMOVED + 1))
-        log_msg "Deleted: $ip"
+    KEEP_MAP["$ip"]=1
+done < /tmp/keep_ips.txt
+
+# Delete IPs not in keep list
+REMOVED=0
+ip -6 addr show eth0 | grep 'inet6.*scope global' | awk '{print $2}' | cut -d'/' -f1 | while read ip; do
+    if [ -z "${KEEP_MAP[$ip]}" ]; then
+        if ip -6 addr del ${ip}/64 dev eth0 2>/dev/null; then
+            REMOVED=$((REMOVED + 1))
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Deleted: $ip" >> $LOGFILE
+        fi
     fi
-done < /tmp/delete_ips.txt
+done
+
+sleep 1
 
 AFTER=$(ip -6 addr show eth0 | grep -c 'inet6.*scope global')
 
-log_msg "Cleanup: Before=$BEFORE After=$AFTER Removed=$REMOVED Target=$KEEP_COUNT"
+log_msg "Cleanup: Before=$BEFORE After=$AFTER Target=$KEEP_COUNT"
 
-# Cleanup temp files
-rm -f /tmp/keep_ips.txt /tmp/all_ips.txt /tmp/delete_ips.txt
+rm -f /tmp/keep_ips.txt
 
-# Verify and fix
 PROXY_COUNT=$(wc -l < $WORKDATA)
-TOTAL_IPS=$AFTER
 
-if [ "$TOTAL_IPS" -ne "$PROXY_COUNT" ]; then
-    log_msg "MISMATCH: Proxies=$PROXY_COUNT IPs=$TOTAL_IPS - FIXING"
+if [ "$AFTER" -ne "$PROXY_COUNT" ]; then
+    log_msg "MISMATCH: Proxies=$PROXY_COUNT IPs=$AFTER - Auto fixing..."
     awk -F "/" '{system("ip -6 addr add " $5 "/64 dev eth0 2>/dev/null")}' ${WORKDATA}
-    TOTAL_IPS=$(ip -6 addr show eth0 | grep -c 'inet6.*scope global')
-    log_msg "Fixed: IPs now=$TOTAL_IPS"
+    AFTER=$(ip -6 addr show eth0 | grep -c 'inet6.*scope global')
+    log_msg "Fixed: IPs=$AFTER"
 fi
 
-log_msg "========== Completed: Proxies=$PROXY_COUNT IPs=$TOTAL_IPS =========="
+log_msg "========== Done: Proxies=$PROXY_COUNT IPs=$AFTER PID=$(pgrep 3proxy) =========="
 ROTEOF
 
 chmod +x /home/bkns/rotate_ipv6.sh
-
-echo "Script updated!"
