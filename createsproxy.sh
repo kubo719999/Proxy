@@ -1,12 +1,6 @@
-# Tải script tôi vừa sửa (từ file tôi gửi)
-cd /home/bkns
-
-# Xóa script cũ
-rm -f rotate_ip.sh
-
-# Tạo script mới
-cat > rotate_ip.sh << 'EOFSCRIPT'
+cat > /home/bkns/rotate_ip.sh << 'EOFSCRIPT'
 #!/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 WORKDIR="/home/bkns"
 WORKDATA="${WORKDIR}/data.txt"
 FIRST_PORT=22000
@@ -15,10 +9,7 @@ LAST_PORT=22049
 rotate_ipv6() {
     echo "[$(date)] Starting IP rotation..."
     
-    # Lưu danh sách IPv6 cũ từ data.txt
-    OLD_IPV6=$(awk -F "/" '{print $5}' ${WORKDATA} 2>/dev/null)
-    
-    # Xóa tất cả IPv6 cũ trên interface eth0 (chỉ global)
+    # Xóa IPv6 cũ
     echo "[$(date)] Removing old IPv6 addresses..."
     for addr in $(ip -6 addr show dev eth0 | grep -E 'inet6 2403|inet6 2' | grep -v fe80 | awk '{print $2}'); do
         ip -6 addr del $addr dev eth0 2>/dev/null
@@ -26,14 +17,10 @@ rotate_ipv6() {
     
     sleep 1
     
-    # Lấy IPv6 prefix từ DEFAULT GATEWAY
+    # Lấy IPv6 prefix
     IP6=$(ip -6 route show default | awk '{print $3}' | cut -f1-4 -d':')
-    
-    # Lấy IPv4
     IP4=$(curl -4 -s --max-time 5 icanhazip.com 2>/dev/null)
-    if [ -z "$IP4" ]; then
-        IP4=$(ip -4 addr show eth0 | grep inet | awk '{print $2}' | cut -d'/' -f1)
-    fi
+    [ -z "$IP4" ] && IP4=$(ip -4 addr show eth0 | grep inet | awk '{print $2}' | cut -d'/' -f1)
     
     if [ -z "$IP6" ] || [ -z "$IP4" ]; then
         echo "[$(date)] ERROR: Cannot get IP. IP6='$IP6', IP4='$IP4'"
@@ -43,37 +30,32 @@ rotate_ipv6() {
     echo "[$(date)] Using IPv6 prefix: $IP6"
     echo "[$(date)] Using IPv4: $IP4"
     
-    # Hàm generate IPv6
+    # Generate IPv6
     array=(1 2 3 4 5 6 7 8 9 0 a b c d e f)
     gen64() {
-        ip64() {
-            echo "${array[$RANDOM % 16]}${array[$RANDOM % 16]}${array[$RANDOM % 16]}${array[$RANDOM % 16]}"
-        }
+        ip64() { echo "${array[$RANDOM % 16]}${array[$RANDOM % 16]}${array[$RANDOM % 16]}${array[$RANDOM % 16]}"; }
         echo "$1:$(ip64):$(ip64):$(ip64):$(ip64)"
     }
     
-    # Tạo data.txt mới
+    # Tạo data mới
     echo "[$(date)] Generating new proxy data..."
     > ${WORKDATA}.new
     for port in $(seq $FIRST_PORT $LAST_PORT); do
         echo "AnhVip17102/AnhVip17102/$IP4/$port/$(gen64 $IP6)" >> ${WORKDATA}.new
     done
     
-    # Tạo script add IPv6
+    # Add IPv6 mới
     awk -F "/" '{print "ip -6 addr add " $5 "/64 dev eth0"}' ${WORKDATA}.new > ${WORKDIR}/boot_ifconfig.sh.new
     chmod +x ${WORKDIR}/boot_ifconfig.sh.new
     
-    # Apply IPv6 addresses mới
     echo "[$(date)] Adding 50 new IPv6 addresses..."
     bash ${WORKDIR}/boot_ifconfig.sh.new 2>&1 | grep -v "File exists"
-    
     sleep 2
     
-    # Verify số lượng IPv6
     IPV6_COUNT=$(ip -6 addr show dev eth0 | grep -E 'inet6 2403' | wc -l)
     echo "[$(date)] IPv6 count: $IPV6_COUNT/50"
     
-    # Regenerate 3proxy config
+    # Regenerate config
     echo "[$(date)] Regenerating 3proxy config..."
     cat > /usr/local/etc/3proxy/3proxy.cfg.new <<EOFCONFIG
 daemon
@@ -95,7 +77,6 @@ EOFCONFIG
     mv ${WORKDATA}.new ${WORKDATA}
     mv ${WORKDIR}/boot_ifconfig.sh.new ${WORKDIR}/boot_ifconfig.sh
     mv /usr/local/etc/3proxy/3proxy.cfg.new /usr/local/etc/3proxy/3proxy.cfg
-    
     awk -F "/" '{print $3 ":" $4 ":" $1 ":" $2 }' ${WORKDATA} > ${WORKDIR}/proxy.txt
     
     # Restart 3proxy
@@ -104,7 +85,6 @@ EOFCONFIG
     sleep 2
     ulimit -n 10048
     /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg
-    
     sleep 2
     
     if pgrep 3proxy > /dev/null; then
@@ -120,8 +100,4 @@ EOFCONFIG
 rotate_ipv6
 EOFSCRIPT
 
-# Cấp quyền
-chmod +x rotate_ip.sh
-
-# Chạy test
-bash rotate_ip.sh
+chmod +x /home/bkns/rotate_ip.sh
