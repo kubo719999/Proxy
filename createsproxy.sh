@@ -1,12 +1,6 @@
-# Tải script tôi vừa sửa (từ file tôi gửi)
-cd /home/bkns
-
-# Xóa script cũ
-rm -f rotate_ip.sh
-
-# Tạo script mới
-cat > rotate_ip.sh << 'EOFSCRIPT'
+cat > /home/bkns/rotate_ip.sh << 'EOFSCRIPT'
 #!/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 WORKDIR="/home/bkns"
 WORKDATA="${WORKDIR}/data.txt"
 FIRST_PORT=22000
@@ -20,19 +14,19 @@ rotate_ipv6() {
     
     # Xóa tất cả IPv6 cũ trên interface eth0 (chỉ global)
     echo "[$(date)] Removing old IPv6 addresses..."
-    for addr in $(ip -6 addr show dev eth0 | grep -E 'inet6 2403|inet6 2' | grep -v fe80 | awk '{print $2}'); do
-        ip -6 addr del $addr dev eth0 2>/dev/null
+    for addr in $(/usr/sbin/ip -6 addr show dev eth0 | grep -E 'inet6 2403|inet6 2' | grep -v fe80 | awk '{print $2}'); do
+        /usr/sbin/ip -6 addr del $addr dev eth0 2>/dev/null
     done
     
     sleep 1
     
     # Lấy IPv6 prefix từ DEFAULT GATEWAY
-    IP6=$(ip -6 route show default | awk '{print $3}' | cut -f1-4 -d':')
+    IP6=$(/usr/sbin/ip -6 route show default | awk '{print $3}' | cut -f1-4 -d':')
     
     # Lấy IPv4
     IP4=$(curl -4 -s --max-time 5 icanhazip.com 2>/dev/null)
     if [ -z "$IP4" ]; then
-        IP4=$(ip -4 addr show eth0 | grep inet | awk '{print $2}' | cut -d'/' -f1)
+        IP4=$(/usr/sbin/ip -4 addr show eth0 | grep inet | awk '{print $2}' | cut -d'/' -f1)
     fi
     
     if [ -z "$IP6" ] || [ -z "$IP4" ]; then
@@ -60,7 +54,7 @@ rotate_ipv6() {
     done
     
     # Tạo script add IPv6
-    awk -F "/" '{print "ip -6 addr add " $5 "/64 dev eth0"}' ${WORKDATA}.new > ${WORKDIR}/boot_ifconfig.sh.new
+    awk -F "/" '{print "/usr/sbin/ip -6 addr add " $5 "/64 dev eth0"}' ${WORKDATA}.new > ${WORKDIR}/boot_ifconfig.sh.new
     chmod +x ${WORKDIR}/boot_ifconfig.sh.new
     
     # Apply IPv6 addresses mới
@@ -70,7 +64,7 @@ rotate_ipv6() {
     sleep 2
     
     # Verify số lượng IPv6
-    IPV6_COUNT=$(ip -6 addr show dev eth0 | grep -E 'inet6 2403' | wc -l)
+    IPV6_COUNT=$(/usr/sbin/ip -6 addr show dev eth0 | grep -E 'inet6 2403' | wc -l)
     echo "[$(date)] IPv6 count: $IPV6_COUNT/50"
     
     # Regenerate 3proxy config
@@ -120,8 +114,4 @@ EOFCONFIG
 rotate_ipv6
 EOFSCRIPT
 
-# Cấp quyền
-chmod +x rotate_ip.sh
-
-# Chạy test
-bash rotate_ip.sh
+chmod +x /home/bkns/rotate_ip.sh
