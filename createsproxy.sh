@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================================
 # AUTO CREATE + ROTATE IPV6 PROXY
-# V4.1 FINAL: SAFE TRIM + NO PARALLEL + NO NET LOSS
+# V4.2 FINAL HARD SAFE VERSION
 # ==========================================================
 
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
@@ -31,10 +31,7 @@ exec >> /home/bkns/rotation.log 2>&1
 # ===== LOCK: PREVENT PARALLEL RUN =====
 LOCKFILE="/var/run/rotate_ipv6.lock"
 exec 9>"$LOCKFILE"
-if ! flock -n 9; then
-    echo "[$(date)] Another rotate is running. Exit."
-    exit 0
-fi
+flock -n 9 || exit 0
 
 WORKDIR="/home/bkns"
 WORKDATA="$WORKDIR/data.txt"
@@ -49,18 +46,20 @@ TOTAL_PORT=50
 
 echo "[$(date)] ===== ROTATE START ====="
 
-# ===== 1. ENSURE BASE IPV6 EXISTS =====
+# ===== 1. HARD ENSURE BASE IPV6 EXISTS =====
 BASE_IPV6=$(ip -6 addr show dev "$IFACE" scope global | awk '/inet6/ {print $2}' | head -n1 | cut -d/ -f1)
 
 if [ -z "$BASE_IPV6" ]; then
     PREFIX=$(ip -6 route | awk '/\/64/ && !/fe80/ {print $1}' | head -n1 | cut -d/ -f1)
-    if [ -z "$PREFIX" ]; then
-        echo "[$(date)] ERROR: NO IPV6 /64 ROUTE"
-        exit 1
-    fi
     BASE_IPV6=$(echo "$PREFIX" | sed 's/::$//'):100
     ip -6 addr add "$BASE_IPV6/64" dev "$IFACE"
     sleep 1
+fi
+
+# VERIFY BASE REALLY EXISTS
+if ! ip -6 addr show dev "$IFACE" scope global | grep -q "$BASE_IPV6"; then
+    echo "[$(date)] FATAL: BASE IPV6 NOT PRESENT - ABORT"
+    exit 1
 fi
 
 echo "[$(date)] BASE IPV6: $BASE_IPV6"
@@ -70,10 +69,8 @@ GW_IPV6=$(ip -6 route | awk '/default/ {print $3}')
 ip -6 route replace default via "$GW_IPV6" dev "$IFACE" src "$BASE_IPV6"
 ip -6 route flush cache
 
-# ===== 3. HARD TRIM: KEEP ONLY BASE (PREFIX SAFE) =====
-echo "[$(date)] Trimming old IPv6 (keep BASE only)..."
+# ===== 3. HARD TRIM: KEEP BASE ONLY =====
 ip -6 addr show dev "$IFACE" scope global | awk '/inet6/ {print $2}' | while read ip; do
-    # keep BASE by prefix match, ignore /64 or /128
     if [[ "$ip" != $BASE_IPV6* ]]; then
         ip -6 addr del "$ip" dev "$IFACE" 2>/dev/null
     fi
@@ -107,7 +104,7 @@ done
 
 sleep 2
 COUNT=$(ip -6 addr show dev "$IFACE" scope global | wc -l)
-echo "[$(date)] TOTAL IPV6 NOW: $COUNT (BASE + PROXY)"
+echo "[$(date)] TOTAL IPV6: $COUNT (EXPECTED 51)"
 
 # ===== 7. WRITE 3PROXY CONFIG =====
 {
@@ -124,18 +121,13 @@ awk -F "/" '{print "allow " $1 "\nproxy -6 -n -a -p" $4 " -i" $3 " -e"$5 "\nflus
 mv "${WORKDATA}.new" "$WORKDATA"
 awk -F "/" '{print $3 ":" $4 ":" $1 ":" $2}' "$WORKDATA" > "$WORKDIR/proxy.txt"
 
-# ===== 8. RESTART 3PROXY SAFELY =====
+# ===== 8. RESTART 3PROXY =====
 pkill 3proxy 2>/dev/null
 sleep 2
 ulimit -n 10048
 /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg
 
-if pgrep 3proxy >/dev/null; then
-    echo "[$(date)] ROTATE SUCCESS"
-else
-    echo "[$(date)] ROTATE FAILED"
-fi
-
+pgrep 3proxy && echo "[$(date)] ROTATE SUCCESS" || echo "[$(date)] ROTATE FAIL"
 echo "[$(date)] ===== ROTATE END ====="
 EOF
 
@@ -152,7 +144,7 @@ fi
 bash "$ROTATE_SCRIPT"
 
 echo "=========================================="
-echo "INSTALL DONE - V4.1 FIX TRIM"
+echo "INSTALL DONE - V4.2 FINAL"
 echo "PROXY FILE : /home/bkns/proxy.txt"
 echo "LOG FILE   : /home/bkns/rotation.log"
 echo "ROTATE     : EVERY 10 MINUTES"
