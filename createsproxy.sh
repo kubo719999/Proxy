@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================================
 # AUTO CREATE + ROTATE IPV6 PROXY
-# SAFE VERSION: NO NET LOSS - NO RAM LEAK
+# V3 SAFE VERSION: NO NET LOSS - NO RAM LEAK - NO PARALLEL
 # ==========================================================
 
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
@@ -27,6 +27,14 @@ cat > "$ROTATE_SCRIPT" << 'EOF'
 #!/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 exec >> /home/bkns/rotation.log 2>&1
+
+# ===== LOCK: PREVENT PARALLEL RUN =====
+LOCKFILE="/var/run/rotate_ipv6.lock"
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+    echo "[$(date)] Another rotate instance is running. Exit."
+    exit 0
+fi
 
 WORKDIR="/home/bkns"
 WORKDATA="$WORKDIR/data.txt"
@@ -57,7 +65,7 @@ fi
 
 echo "[$(date)] BASE IPV6: $BASE_IPV6"
 
-# ===== 2. LOCK IPV6 SOURCE (CRITICAL) =====
+# ===== 2. LOCK IPV6 SOURCE =====
 GW_IPV6=$(ip -6 route | awk '/default/ {print $3}')
 ip -6 route replace default via "$GW_IPV6" dev "$IFACE" src "$BASE_IPV6"
 ip -6 route flush cache
@@ -69,7 +77,6 @@ ip -6 addr show dev "$IFACE" scope global | awk '/inet6/ {print $2}' | while rea
         ip -6 addr del "$ip" dev "$IFACE" 2>/dev/null
     fi
 done
-
 sleep 1
 
 # ===== 4. GET PREFIX FROM BASE =====
@@ -97,7 +104,6 @@ for port in $(seq $FIRST_PORT $LAST_PORT); do
 done
 
 sleep 2
-
 COUNT=$(ip -6 addr show dev "$IFACE" scope global | wc -l)
 echo "[$(date)] TOTAL IPV6 NOW: $COUNT (BASE + PROXY)"
 
@@ -110,7 +116,6 @@ echo "nserver 8.8.4.4"
 echo "timeouts 1 5 30 60 180 1800 15 60"
 echo "auth strong"
 echo "users $USER:CL:$PASS"
-
 awk -F "/" '{print "allow " $1 "\nproxy -6 -n -a -p" $4 " -i" $3 " -e"$5 "\nflush"}' "${WORKDATA}.new"
 } > /usr/local/etc/3proxy/3proxy.cfg
 
@@ -134,7 +139,7 @@ EOF
 
 chmod +x "$ROTATE_SCRIPT"
 
-# ================= ADD CRON =================
+# ================= ADD CRON (ONCE) =================
 CRON_CMD="/bin/bash $ROTATE_SCRIPT"
 (crontab -l 2>/dev/null | grep -F "$CRON_CMD") >/dev/null
 if [ $? -ne 0 ]; then
@@ -145,7 +150,7 @@ fi
 bash "$ROTATE_SCRIPT"
 
 echo "=========================================="
-echo "INSTALL DONE - SAFE VERSION"
+echo "INSTALL DONE - V3 (NO PARALLEL)"
 echo "PROXY FILE : /home/bkns/proxy.txt"
 echo "LOG FILE   : /home/bkns/rotation.log"
 echo "ROTATE     : EVERY 10 MINUTES"
