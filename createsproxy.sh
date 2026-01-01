@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================================
 # AUTO CREATE + ROTATE IPV6 PROXY
-# V3 SAFE VERSION: NO NET LOSS - NO RAM LEAK - NO PARALLEL
+# V4.1 FINAL: SAFE TRIM + NO PARALLEL + NO NET LOSS
 # ==========================================================
 
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
@@ -32,7 +32,7 @@ exec >> /home/bkns/rotation.log 2>&1
 LOCKFILE="/var/run/rotate_ipv6.lock"
 exec 9>"$LOCKFILE"
 if ! flock -n 9; then
-    echo "[$(date)] Another rotate instance is running. Exit."
+    echo "[$(date)] Another rotate is running. Exit."
     exit 0
 fi
 
@@ -70,13 +70,15 @@ GW_IPV6=$(ip -6 route | awk '/default/ {print $3}')
 ip -6 route replace default via "$GW_IPV6" dev "$IFACE" src "$BASE_IPV6"
 ip -6 route flush cache
 
-# ===== 3. REMOVE OLD PROXY IPV6 (KEEP BASE) =====
-echo "[$(date)] Removing old proxy IPv6..."
+# ===== 3. HARD TRIM: KEEP ONLY BASE (PREFIX SAFE) =====
+echo "[$(date)] Trimming old IPv6 (keep BASE only)..."
 ip -6 addr show dev "$IFACE" scope global | awk '/inet6/ {print $2}' | while read ip; do
-    if [[ "$ip" != "$BASE_IPV6/64" ]]; then
+    # keep BASE by prefix match, ignore /64 or /128
+    if [[ "$ip" != $BASE_IPV6* ]]; then
         ip -6 addr del "$ip" dev "$IFACE" 2>/dev/null
     fi
 done
+
 sleep 1
 
 # ===== 4. GET PREFIX FROM BASE =====
@@ -150,7 +152,7 @@ fi
 bash "$ROTATE_SCRIPT"
 
 echo "=========================================="
-echo "INSTALL DONE - V3 (NO PARALLEL)"
+echo "INSTALL DONE - V4.1 FIX TRIM"
 echo "PROXY FILE : /home/bkns/proxy.txt"
 echo "LOG FILE   : /home/bkns/rotation.log"
 echo "ROTATE     : EVERY 10 MINUTES"
