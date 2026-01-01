@@ -1,9 +1,7 @@
 #!/bin/bash
 # ==========================================================
-# AUTO CREATE + ROTATE IPV6 PROXY
-# USER/PASS: AnhVip17102
-# PORT: 22000 - 22049 (50 PORT)
-# ROTATE: 10 MINUTES
+# AUTO CREATE + ROTATE IPV6 PROXY (FIXED VERSION)
+# KEEP BASE IPV6 - NO IPV6 LOSS
 # ==========================================================
 
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
@@ -41,14 +39,30 @@ LAST_PORT=22049
 
 echo "[$(date)] ===== ROTATE START ====="
 
-# REMOVE OLD IPV6
+# ===== AUTO DETECT BASE IPV6 (FIRST GLOBAL IP) =====
+BASE_IPV6=$(ip -6 addr show dev $IFACE scope global | awk '/inet6/ {print $2}' | head -n1 | cut -d/ -f1)
+
+# IF NO BASE IPV6 -> ADD ONE FROM ROUTED /64
+if [ -z "$BASE_IPV6" ]; then
+    PREFIX=$(ip -6 route | awk '/::\/64/ {print $1}' | head -n1 | cut -d/ -f1)
+    BASE_IPV6="${PREFIX}100"
+    ip -6 addr add $BASE_IPV6/64 dev $IFACE
+    sleep 1
+fi
+
+echo "[$(date)] BASE IPV6: $BASE_IPV6"
+
+# ===== REMOVE OLD PROXY IPV6 (KEEP BASE) =====
 ip -6 addr show dev $IFACE scope global | awk '/inet6/ {print $2}' | while read ip; do
-    ip -6 addr del $ip dev $IFACE 2>/dev/null
+    if [[ "$ip" != "$BASE_IPV6/64" ]]; then
+        ip -6 addr del $ip dev $IFACE 2>/dev/null
+    fi
 done
+
 sleep 1
 
-# GET IP
-IP6_PREFIX=$(ip -6 addr show dev $IFACE scope global | awk '/inet6/ {print $2}' | head -n1 | cut -d'/' -f1 | cut -f1-4 -d':')
+# ===== GET PREFIX FROM BASE =====
+IP6_PREFIX=$(echo $BASE_IPV6 | cut -f1-4 -d':')
 IP4=$(curl -4 -s --max-time 5 icanhazip.com)
 [ -z "$IP4" ] && IP4=$(ip -4 addr show $IFACE | awk '/inet /{print $2}' | cut -d/ -f1)
 
@@ -61,6 +75,7 @@ gen_ipv6() {
     printf "%s:%04x:%04x:%04x:%04x\n" "$IP6_PREFIX" $RANDOM $RANDOM $RANDOM $RANDOM
 }
 
+# ===== CREATE 50 PROXY IPV6 =====
 > ${WORKDATA}.new
 for port in $(seq $FIRST_PORT $LAST_PORT); do
     IPV6=$(gen_ipv6)
@@ -70,12 +85,16 @@ done
 
 sleep 2
 
-# WRITE 3PROXY CONFIG
+COUNT=$(ip -6 addr show dev $IFACE scope global | wc -l)
+echo "[$(date)] TOTAL IPV6 NOW: $COUNT (BASE + PROXY)"
+
+# ===== WRITE 3PROXY CONFIG =====
 {
 echo "daemon"
 echo "maxconn 2000"
 echo "nserver 1.1.1.1"
 echo "nserver 8.8.4.4"
+echo "timeouts 1 5 30 60 180 1800 15 60"
 echo "auth strong"
 echo "users $USER:CL:$PASS"
 
@@ -85,7 +104,7 @@ awk -F "/" '{print "allow " $1 "\nproxy -6 -n -a -p" $4 " -i" $3 " -e"$5 "\nflus
 mv ${WORKDATA}.new ${WORKDATA}
 awk -F "/" '{print $3 ":" $4 ":" $1 ":" $2}' ${WORKDATA} > $WORKDIR/proxy.txt
 
-# RESTART 3PROXY
+# ===== RESTART 3PROXY SAFELY =====
 pkill 3proxy 2>/dev/null
 sleep 2
 ulimit -n 10048
@@ -107,9 +126,9 @@ fi
 bash $ROTATE_SCRIPT
 
 echo "=========================================="
-echo "INSTALL DONE!"
-echo "PROXY FILE: /home/bkns/proxy.txt"
-echo "LOG FILE  : /home/bkns/rotation.log"
-echo "ROTATE    : EVERY 10 MINUTES"
-echo "USER/PASS : AnhVip17102"
+echo "INSTALL DONE (FIXED VERSION)"
+echo "PROXY FILE : /home/bkns/proxy.txt"
+echo "LOG FILE   : /home/bkns/rotation.log"
+echo "ROTATE     : EVERY 10 MINUTES"
+echo "USER/PASS  : AnhVip17102"
 echo "=========================================="
