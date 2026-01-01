@@ -1,3 +1,7 @@
+# Xóa rotation.log cũ để dễ theo dõi
+> /home/bkns/rotation.log
+
+# Tạo lại script rotate_ip.sh HOÀN TOÀN MỚI
 cat > /home/bkns/rotate_ip.sh << 'EOFSCRIPT'
 #!/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
@@ -11,7 +15,7 @@ rotate_ipv6() {
     
     # Xóa IPv6 cũ
     echo "[$(date)] Removing old IPv6 addresses..."
-    for addr in $(ip -6 addr show dev eth0 | grep -E 'inet6 2403|inet6 2' | grep -v fe80 | awk '{print $2}'); do
+    for addr in $(ip -6 addr show dev eth0 | grep -E 'inet6 2403' | awk '{print $2}'); do
         ip -6 addr del $addr dev eth0 2>/dev/null
     done
     
@@ -23,12 +27,11 @@ rotate_ipv6() {
     [ -z "$IP4" ] && IP4=$(ip -4 addr show eth0 | grep inet | awk '{print $2}' | cut -d'/' -f1)
     
     if [ -z "$IP6" ] || [ -z "$IP4" ]; then
-        echo "[$(date)] ERROR: Cannot get IP. IP6='$IP6', IP4='$IP4'"
+        echo "[$(date)] ERROR: IP6='$IP6', IP4='$IP4'"
         return 1
     fi
     
-    echo "[$(date)] Using IPv6 prefix: $IP6"
-    echo "[$(date)] Using IPv4: $IP4"
+    echo "[$(date)] IPv6: $IP6 | IPv4: $IP4"
     
     # Generate IPv6
     array=(1 2 3 4 5 6 7 8 9 0 a b c d e f)
@@ -38,26 +41,23 @@ rotate_ipv6() {
     }
     
     # Tạo data mới
-    echo "[$(date)] Generating new proxy data..."
+    echo "[$(date)] Generating 50 proxies..."
     > ${WORKDATA}.new
     for port in $(seq $FIRST_PORT $LAST_PORT); do
         echo "AnhVip17102/AnhVip17102/$IP4/$port/$(gen64 $IP6)" >> ${WORKDATA}.new
     done
     
-    # Add IPv6 mới
-    awk -F "/" '{print "ip -6 addr add " $5 "/64 dev eth0"}' ${WORKDATA}.new > ${WORKDIR}/boot_ifconfig.sh.new
-    chmod +x ${WORKDIR}/boot_ifconfig.sh.new
-    
-    echo "[$(date)] Adding 50 new IPv6 addresses..."
-    bash ${WORKDIR}/boot_ifconfig.sh.new 2>&1 | grep -v "File exists"
+    # Add IPv6
+    echo "[$(date)] Adding IPv6 addresses..."
+    awk -F "/" '{print "ip -6 addr add " $5 "/64 dev eth0 2>/dev/null"}' ${WORKDATA}.new | bash
     sleep 2
     
-    IPV6_COUNT=$(ip -6 addr show dev eth0 | grep -E 'inet6 2403' | wc -l)
-    echo "[$(date)] IPv6 count: $IPV6_COUNT/50"
+    IPV6_COUNT=$(ip -6 addr show dev eth0 | grep 2403 | wc -l)
+    echo "[$(date)] IPv6 added: $IPV6_COUNT/50"
     
-    # Regenerate config
-    echo "[$(date)] Regenerating 3proxy config..."
-    cat > /usr/local/etc/3proxy/3proxy.cfg.new <<EOFCONFIG
+    # Config 3proxy
+    echo "[$(date)] Updating 3proxy config..."
+    cat > /usr/local/etc/3proxy/3proxy.cfg <<EOFCONFIG
 daemon
 maxconn 2000
 nserver 1.1.1.1
@@ -68,31 +68,25 @@ setuid 65535
 stacksize 6291456 
 flush
 auth strong
-
 users $(awk -F "/" 'BEGIN{ORS="";} {print $1 ":CL:" $2 " "}' ${WORKDATA}.new)
-
-$(awk -F "/" '{print "auth strong\nallow " $1 "\nproxy -6 -n -a -p" $4 " -i" $3 " -e"$5"\nflush\n"}' ${WORKDATA}.new)
+$(awk -F "/" '{print "auth strong\nallow " $1 "\nproxy -6 -n -a -p" $4 " -i" $3 " -e"$5"\nflush"}' ${WORKDATA}.new)
 EOFCONFIG
     
     mv ${WORKDATA}.new ${WORKDATA}
-    mv ${WORKDIR}/boot_ifconfig.sh.new ${WORKDIR}/boot_ifconfig.sh
-    mv /usr/local/etc/3proxy/3proxy.cfg.new /usr/local/etc/3proxy/3proxy.cfg
-    awk -F "/" '{print $3 ":" $4 ":" $1 ":" $2 }' ${WORKDATA} > ${WORKDIR}/proxy.txt
+    awk -F "/" '{print $3 ":" $4 ":" $1 ":" $2}' ${WORKDATA} > ${WORKDIR}/proxy.txt
     
     # Restart 3proxy
     echo "[$(date)] Restarting 3proxy..."
     pkill -9 3proxy 2>/dev/null
-    sleep 2
+    sleep 1
     ulimit -n 10048
     /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg
     sleep 2
     
-    if pgrep 3proxy > /dev/null; then
-        echo "[$(date)] ✓ SUCCESS! Rotation completed"
-        echo "[$(date)] ✓ 3proxy running"
-        echo "[$(date)] ✓ IPv6: $IPV6_COUNT addresses"
+    if pgrep 3proxy >/dev/null; then
+        echo "[$(date)] ✓ SUCCESS! IPv6: $IPV6_COUNT"
     else
-        echo "[$(date)] ✗ ERROR: 3proxy not running!"
+        echo "[$(date)] ✗ FAILED! 3proxy not running"
         return 1
     fi
 }
@@ -101,3 +95,6 @@ rotate_ipv6
 EOFSCRIPT
 
 chmod +x /home/bkns/rotate_ip.sh
+
+# Test ngay
+echo "=== TESTING SCRIPT ===" && bash /home/bkns/rotate_ip.sh
