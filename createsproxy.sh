@@ -15,12 +15,10 @@ gen64() {
 install_dependencies() {
     echo "Installing dependencies..."
     if command -v yum >/dev/null 2>&1; then
-        echo "ip_resolve=4" >> /etc/yum.conf 2>/dev/null
-        yum install -y iproute vim-common wget gcc make 2>&1 | grep -v "^$"
+        yum install -y iproute wget gcc make >/dev/null 2>&1
     elif command -v apt-get >/dev/null 2>&1; then
-        echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4
-        apt-get update 2>&1 | grep -v "^$"
-        apt-get install -y iproute2 vim-common wget gcc make 2>&1 | grep -v "^$"
+        apt-get update >/dev/null 2>&1
+        apt-get install -y iproute2 wget gcc make >/dev/null 2>&1
     fi
     echo "Done"
 }
@@ -89,30 +87,24 @@ PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 WORKDIR="/home/bkns"
 WORKDATA="${WORKDIR}/data.txt"
 LOGFILE="${WORKDIR}/rotate.log"
-FIXED_USER="AnhVip17102"
-FIXED_PASS="AnhVip17102"
 
 log_msg() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a $LOGFILE
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> $LOGFILE
 }
 
 if [ -f "$LOGFILE" ]; then
     LOG_SIZE=$(du -m "$LOGFILE" 2>/dev/null | cut -f1)
-    if [ "$LOG_SIZE" -gt 10 ]; then
-        tail -n 1000 "$LOGFILE" > "${LOGFILE}.tmp"
-        mv "${LOGFILE}.tmp" "$LOGFILE"
-    fi
+    [ "$LOG_SIZE" -gt 10 ] && tail -n 1000 "$LOGFILE" > "${LOGFILE}.tmp" && mv "${LOGFILE}.tmp" "$LOGFILE"
 fi
 
-log_msg "Starting Rotation"
+log_msg "Starting rotation"
 
-IP6=$(head -1 $WORKDATA 2>/dev/null | cut -d'/' -f5 | cut -f1-4 -d':')
+IP6=$(head -1 $WORKDATA | cut -d'/' -f5 | cut -f1-4 -d':')
 [ -z "$IP6" ] && exit 1
 
 cp $WORKDATA ${WORKDATA}.backup
-awk -F "/" '{print $5}' $WORKDATA > /tmp/old_ips.txt
 
-awk -v ip6="$IP6" -v user="$FIXED_USER" -v pass="$FIXED_PASS" -F "/" '
+awk -v ip6="$IP6" -F "/" '
 BEGIN {
     srand();
     hex="0123456789abcdef";
@@ -130,11 +122,10 @@ BEGIN {
     
     new_ip6 = ip6 ":" part1 ":" part2 ":" part3 ":" part4;
     
-    print user "/" pass "/" $3 "/" $4 "/" new_ip6;
+    print $1 "/" $2 "/" $3 "/" $4 "/" new_ip6;
 }' $WORKDATA > ${WORKDATA}.new
 
 [ ! -s ${WORKDATA}.new ] && exit 1
-
 mv ${WORKDATA}.new $WORKDATA
 
 awk -F "/" '{system("ip -6 addr add " $5 "/64 dev eth0 2>/dev/null")}' ${WORKDATA}
@@ -146,45 +137,29 @@ daemon
 maxconn 4000
 nserver 1.1.1.1
 nserver 8.8.4.4
-nserver 2001:4860:4860::8888
-nserver 2001:4860:4860::8844
-nscache 65536
 timeouts 1 5 30 60 180 1800 15 60
 setgid 65535
 setuid 65535
 stacksize 6291456
 flush
 auth strong
+users AnhVip17102:CL:AnhVip17102
+
 EOFCFG
 
-echo "users ${FIXED_USER}:CL:${FIXED_PASS}" >> /usr/local/etc/3proxy/3proxy.cfg
-echo "" >> /usr/local/etc/3proxy/3proxy.cfg
-
-awk -v user="$FIXED_USER" -F "/" '{
+awk -F "/" '{
     print "auth strong";
-    print "allow " user;
+    print "allow AnhVip17102";
     print "proxy -6 -n -a -p" $4 " -i" $3 " -e" $5;
     print "flush";
-    print "";
 }' ${WORKDATA} >> /usr/local/etc/3proxy/3proxy.cfg
 
 pkill -9 3proxy 2>/dev/null
 sleep 2
 ulimit -n 65536
 /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
-sleep 3
 
-(
-    sleep 60
-    while IFS= read -r old_ip; do
-        if ! grep -q "^${old_ip}$" <(awk -F "/" '{print $5}' ${WORKDATA}); then
-            ip -6 addr del ${old_ip}/64 dev eth0 2>/dev/null
-        fi
-    done < /tmp/old_ips.txt
-    rm -f /tmp/old_ips.txt
-) &
-
-log_msg "Rotation completed"
+log_msg "Completed"
 ROTEOF
 
     chmod +x /home/bkns/rotate_ipv6.sh
@@ -224,7 +199,7 @@ IP4=$(curl -4 -s icanhazip.com)
 IP6=$(curl -6 -s icanhazip.com 2>/dev/null | cut -f1-4 -d':')
 
 [ -z "$IP4" ] && echo "No IPv4" && exit 1
-[ -z "$IP6" ] && IP6=$(ip -6 addr show eth0 | grep "inet6" | grep -v "fe80" | head -1 | awk '{print $2}' | cut -f1-4 -d':')
+[ -z "$IP6" ] && IP6=$(ip -6 addr show | grep "inet6" | grep -v "fe80" | head -1 | awk '{print $2}' | cut -f1-4 -d':')
 [ -z "$IP6" ] && echo "No IPv6" && exit 1
 
 FIRST_PORT=10000
@@ -247,7 +222,6 @@ ulimit -n 65536
 EOF
 
 chmod +x /etc/rc.d/rc.local
-systemctl enable rc-local 2>/dev/null
 
 pkill -9 3proxy 2>/dev/null
 sleep 2
@@ -265,14 +239,11 @@ rm -rf /root/3proxy-* 2>/dev/null
 echo ""
 echo "DONE"
 echo "Ports: 100 (10000-10099)"
-echo "User: ${FIXED_USER}"
-echo "Pass: ${FIXED_PASS}"
+echo "User/Pass: ${FIXED_USER}"
 echo "IPv4: ${IP4}"
 echo "IPv6: ${IP6}"
 echo "Rotation: 10 minutes"
-echo "Pool: 100 IPs (1 per port, rotates every 10 min)"
+echo "Pool: 100 IPs"
 echo ""
-echo "Proxy list: /home/bkns/proxy.txt"
-echo ""
-echo "Test: curl -x ${FIXED_USER}:${FIXED_PASS}@${IP4}:10000 https://api64.ipify.org"
+echo "List: /home/bkns/proxy.txt"
 echo ""
