@@ -13,7 +13,7 @@ install_deps() {
         apt-get update >/dev/null 2>&1
         apt-get install -y gcc make git wget iproute2 vim-common ndppd >/dev/null 2>&1
     fi
-    echo "    ✅ Done"
+    echo "    Done"
 }
 
 install_3proxy() {
@@ -27,7 +27,7 @@ install_3proxy() {
     cp src/3proxy /usr/local/3proxy/bin/
     cd /root
     rm -rf 3proxy-0.8.13 0.8.13.tar.gz
-    echo "    ✅ Done"
+    echo "    Done"
 }
 
 detect_network() {
@@ -37,8 +37,8 @@ detect_network() {
     IP6_FULL=$(curl -6 -s icanhazip.com 2>/dev/null)
     IP6_PREFIX=$(echo $IP6_FULL | cut -d: -f1-4)
     
-    [ -z "$IP4" ] && echo "    ❌ No IPv4" && exit 1
-    [ -z "$IP6_PREFIX" ] && echo "    ❌ No IPv6" && exit 1
+    [ -z "$IP4" ] && echo "    No IPv4" && exit 1
+    [ -z "$IP6_PREFIX" ] && echo "    No IPv6" && exit 1
     
     IFACE=$(ip -6 route get $IP6_FULL 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
     [ -z "$IFACE" ] && IFACE="eth0"
@@ -49,7 +49,7 @@ detect_network() {
 }
 
 setup_ndp_proxy() {
-    echo "[4/10] Setting up NDP proxy (claims entire /64)..."
+    echo "[4/10] Setting up NDP proxy..."
     
     cat > /etc/ndppd.conf << EOF
 route-ttl 30000
@@ -71,7 +71,7 @@ EOF
     sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
     sysctl -w net.ipv6.conf.$IFACE.proxy_ndp=1 >/dev/null 2>&1
     
-    echo "    ✅ NDP proxy active - VPS can use ANY IP in /64"
+    echo "    Done"
 }
 
 create_random_ip_script() {
@@ -91,7 +91,7 @@ RANDEOF
     chmod +x /usr/local/3proxy/bin/random_ipv6.sh
     echo "$IP6_PREFIX" > /tmp/ipv6_prefix.txt
     
-    echo "    ✅ Generator ready"
+    echo "    Done"
 }
 
 create_3proxy_wrapper() {
@@ -125,7 +125,7 @@ WRAPEOF
         chmod +x /usr/local/3proxy/wrappers/port_${port}.sh
     done
     
-    echo "    ✅ Created 50 wrappers"
+    echo "    Done"
 }
 
 create_supervisor() {
@@ -169,7 +169,7 @@ SUPEOF
     
     chmod +x /usr/local/3proxy/bin/supervisor.sh
     
-    echo "    ✅ Supervisor created"
+    echo "    Done"
 }
 
 start_services() {
@@ -189,10 +189,10 @@ start_services() {
     sleep 3
     
     RUNNING=$(pgrep -f 3proxy | wc -l)
-    echo "    ✅ Started $RUNNING instances"
+    echo "    Started $RUNNING instances"
     
     nohup /usr/local/3proxy/bin/supervisor.sh >/dev/null 2>&1 &
-    echo "    ✅ Supervisor running"
+    echo "    Supervisor running"
 }
 
 create_autostart() {
@@ -229,7 +229,7 @@ STARTEOF
     systemctl daemon-reload
     systemctl enable 3proxy-unlimited >/dev/null 2>&1
     
-    echo "    ✅ Autostart configured"
+    echo "    Done"
 }
 
 create_proxy_list() {
@@ -237,7 +237,6 @@ create_proxy_list() {
     
     cat > /root/proxy.txt << EOF
 # 3PROXY UNLIMITED IPv6 - 50 Ports
-# Each connection uses RANDOM IPv6 from /64 subnet
 # Format: IP:PORT:USER:PASS
 
 EOF
@@ -246,7 +245,7 @@ EOF
         echo "${IP4}:${port}:${FIXED_USER}:${FIXED_PASS}" >> /root/proxy.txt
     done
     
-    echo "    ✅ List saved to /root/proxy.txt"
+    echo "    List saved to /root/proxy.txt"
 }
 
 cleanup() {
@@ -254,8 +253,7 @@ cleanup() {
 }
 
 echo "=============================================="
-echo "  3PROXY UNLIMITED IPv6 - NEW ARCHITECTURE   "
-echo "  Using NDP Proxy + Per-Request Random IP    "
+echo "  3PROXY UNLIMITED IPv6"
 echo "=============================================="
 echo ""
 
@@ -273,54 +271,18 @@ cleanup
 
 echo ""
 echo "=============================================="
-echo "✅ INSTALLATION COMPLETE"
+echo "INSTALLATION COMPLETE"
 echo "=============================================="
 echo ""
-echo "📋 Configuration:"
-echo "   Ports: 50 (10000-10049)"
-echo "   Username: ${FIXED_USER}"
-echo "   Password: ${FIXED_PASS}"
-echo "   IPv4: ${IP4}"
-echo "   IPv6: ${IP6_PREFIX}::/64"
+echo "Ports: 50 (10000-10049)"
+echo "Username: ${FIXED_USER}"
+echo "Password: ${FIXED_PASS}"
+echo "IPv4: ${IP4}"
+echo "IPv6: ${IP6_PREFIX}::/64"
 echo ""
-echo "⚡ How it works:"
-echo "   1. NDP proxy claims ENTIRE /64 subnet"
-echo "   2. Each port runs separate 3proxy instance"
-echo "   3. Each instance uses RANDOM IPv6 from /64"
-echo "   4. No IP pool - generates on demand"
-echo "   5. Supervisor auto-restarts dead instances"
+echo "Proxy list: /root/proxy.txt"
+echo "Supervisor log: /var/log/3proxy_supervisor.log"
 echo ""
-echo "📁 Files:"
-echo "   Proxy list: /root/proxy.txt"
-echo "   Supervisor log: /var/log/3proxy_supervisor.log"
-echo ""
-echo "🧪 Test:"
-echo "   curl -x ${FIXED_USER}:${FIXED_PASS}@${IP4}:10000 https://api64.ipify.org"
-echo "   curl -x ${FIXED_USER}:${FIXED_PASS}@${IP4}:10000 https://api64.ipify.org"
-echo "   # Should show DIFFERENT IPv6!"
+echo "Test: curl -x ${FIXED_USER}:${FIXED_PASS}@${IP4}:10000 https://api64.ipify.org"
 echo ""
 echo "=============================================="
-```
-
-## 🆕 Cơ chế hoàn toàn mới:
-
-### **1. NDP Proxy**
-```
-Thay vì add từng IP → Dùng ndppd claim TOÀN BỘ /64
-→ VPS có thể dùng BẤT KỲ IP nào trong /64
-→ Không cần add IP vào interface!
-```
-
-### **2. Per-Port Instance**
-```
-Không dùng 1 3proxy cho tất cả ports
-→ Mỗi port = 1 instance 3proxy riêng
-→ 50 ports = 50 processes
-→ Mỗi process tự random IP của nó
-```
-
-### **3. Supervisor Daemon**
-```
-Giám sát 50 instances
-→ Instance chết? Restart ngay!
-→ Chạy mỗi 10s check health
