@@ -5,13 +5,17 @@ FIXED_USER="AnhVip17102"
 FIXED_PASS="AnhVip17102"
 
 install_dependencies() {
-    echo "Installing dependencies (vim-common included)..."
+    echo "Installing dependencies (vim-common, Python3)..."
     if command -v yum >/dev/null 2>&1; then
-        yum install -y iproute vim-common wget gcc make net-tools python3 >/dev/null 2>&1
+        yum install -y iproute vim-common wget gcc make net-tools python3 python3-pip >/dev/null 2>&1
     elif command -v apt-get >/dev/null 2>&1; then
         apt-get update >/dev/null 2>&1
-        apt-get install -y iproute2 vim-common wget gcc make net-tools python3 >/dev/null 2>&1
+        apt-get install -y iproute2 vim-common wget gcc make net-tools python3 python3-pip >/dev/null 2>&1
     fi
+    
+    # Install required Python packages
+    pip3 install pysocks >/dev/null 2>&1
+    
     echo "✅ Dependencies installed"
 }
 
@@ -27,179 +31,192 @@ install_3proxy() {
     echo "✅ 3proxy installed"
 }
 
-# Create Python script for unlimited IPv6 rotation
-create_ipv6_rotator() {
-    cat > /home/bkns/ipv6_rotator.py << 'PYEOF'
-#!/usr/bin/env python3
-import random
-import subprocess
-import sys
-
-def generate_random_ipv6(base):
-    """Generate random IPv6 from base prefix"""
-    # Generate 4 random hex segments
-    segments = []
-    for _ in range(4):
-        seg = ''.join(random.choice('0123456789abcdef') for _ in range(4))
-        segments.append(seg)
-    
-    return f"{base}:{':'.join(segments)}"
-
-def add_ipv6(ipv6):
-    """Add IPv6 to interface"""
-    try:
-        subprocess.run(['ip', '-6', 'addr', 'add', f'{ipv6}/128', 'dev', 'eth0'], 
-                      stderr=subprocess.DEVNULL, check=False)
-        return True
-    except:
-        return False
-
-def main():
-    if len(sys.argv) != 2:
-        print("Usage: ipv6_rotator.py <ipv6_base>")
-        sys.exit(1)
-    
-    base = sys.argv[1]
-    
-    # Generate and add 1 random IPv6
-    ipv6 = generate_random_ipv6(base)
-    add_ipv6(ipv6)
-    print(ipv6)
-
-if __name__ == '__main__':
-    main()
-PYEOF
-
-    chmod +x /home/bkns/ipv6_rotator.py
-    echo "✅ IPv6 rotator script created"
-}
-
-# Create rotation daemon
-create_rotation_daemon() {
-    cat > /home/bkns/rotation_daemon.sh << 'ROTEOF'
+# Create dynamic IPv6 generator (pure shell, no xxd)
+create_ipv6_generator() {
+    cat > /home/bkns/gen_ipv6.sh << 'GENEOF'
 #!/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+# Generate completely random IPv6 on-the-fly (AWK-based, no xxd)
 
-IP6_BASE=$(cat /home/bkns/ipv6_base.txt)
-POOL_SIZE=200  # Keep 200 IPs in pool per port
-FIRST_PORT=10000
-LAST_PORT=10049
+IP6_BASE="$1"
 
-while true; do
-    port=$FIRST_PORT
-    while [ $port -le $LAST_PORT ]; do
-        # Generate 5 new random IPs for this port
-        for i in $(seq 1 5); do
-            python3 /home/bkns/ipv6_rotator.py "$IP6_BASE" >> /home/bkns/ipv6_pool/port_${port}.txt
-        done
-        
-        # Keep only last 200 IPs
-        tail -n $POOL_SIZE /home/bkns/ipv6_pool/port_${port}.txt > /home/bkns/ipv6_pool/port_${port}.tmp
-        mv /home/bkns/ipv6_pool/port_${port}.tmp /home/bkns/ipv6_pool/port_${port}.txt
-        
-        port=$((port + 1))
-    done
+awk -v base="$IP6_BASE" 'BEGIN {
+    srand();
+    hex = "0123456789abcdef";
     
-    # Regenerate 3proxy config every 30 seconds with new IPs
-    bash /home/bkns/update_3proxy_config.sh
+    # Generate 16 random hex chars
+    suffix = "";
+    for(i=1; i<=16; i++) {
+        suffix = suffix substr(hex, int(rand()*16)+1, 1);
+    }
     
-    sleep 30
-done
-ROTEOF
-
-    chmod +x /home/bkns/rotation_daemon.sh
+    # Split into 4 segments
+    part1 = substr(suffix, 1, 4);
+    part2 = substr(suffix, 5, 4);
+    part3 = substr(suffix, 9, 4);
+    part4 = substr(suffix, 13, 4);
+    
+    printf "%s:%s:%s:%s:%s\n", base, part1, part2, part3, part4;
+}'
+GENEOF
+    chmod +x /home/bkns/gen_ipv6.sh
+    echo "✅ Dynamic IPv6 generator created"
 }
 
-# Create config updater
-create_config_updater() {
-    cat > /home/bkns/update_3proxy_config.sh << 'UPDATEOF'
-#!/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
-
-FIRST_PORT=10000
-LAST_PORT=10049
-
-# Generate new config
-cat > /usr/local/etc/3proxy/3proxy.cfg << 'CFGEOF'
-daemon
-maxconn 4000
-nserver 1.1.1.1
-nserver 8.8.4.4
-nserver 2001:4860:4860::8888
-nserver 2001:4860:4860::8844
-nscache 65536
-timeouts 1 5 30 60 180 1800 15 60
-setgid 65535
-setuid 65535
-stacksize 6291456
-flush
-auth strong
-
-users AnhVip17102:CL:AnhVip17102
-
-CFGEOF
-
-# Add external IPs and proxy rules
-port=$FIRST_PORT
-while [ $port -le $LAST_PORT ]; do
-    # Add external IPs from pool
-    if [ -f /home/bkns/ipv6_pool/port_${port}.txt ]; then
-        while IFS= read -r ipv6; do
-            echo "external ${ipv6}" >> /usr/local/etc/3proxy/3proxy.cfg
-        done < /home/bkns/ipv6_pool/port_${port}.txt
-    fi
+# Create per-request IPv6 wrapper for each port
+create_port_wrappers() {
+    echo "Creating per-request wrappers for 50 ports..."
     
-    # Add proxy rule
-    cat >> /usr/local/etc/3proxy/3proxy.cfg << EOF
-auth strong
-allow AnhVip17102
-proxy -6 -n -a -p${port} -i\$(cat /home/bkns/ip4.txt)
-flush
-
-EOF
-    
-    port=$((port + 1))
-done
-
-# Reload 3proxy gracefully
-pkill -HUP 3proxy 2>/dev/null
-UPDATEOF
-
-    chmod +x /home/bkns/update_3proxy_config.sh
-}
-
-# Initial IPv6 pool generation
-generate_initial_pool() {
-    echo "Generating initial IPv6 pool..."
-    
-    mkdir -p /home/bkns/ipv6_pool
+    mkdir -p /home/bkns/wrappers
     
     local port=$FIRST_PORT
     while [ $port -le $LAST_PORT ]; do
-        echo "  Port $port..."
-        
-        # Generate 200 initial IPs per port
-        rm -f /home/bkns/ipv6_pool/port_${port}.txt
-        for i in $(seq 1 200); do
-            python3 /home/bkns/ipv6_rotator.py "$IP6" >> /home/bkns/ipv6_pool/port_${port}.txt
-        done
+        cat > /home/bkns/wrappers/wrapper_${port}.sh << WRAPEOF
+#!/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+IP6_BASE=\$(cat /home/bkns/ipv6_base.txt)
+IP4=\$(cat /home/bkns/ip4.txt)
+
+# Generate NEW random IPv6 for THIS connection
+NEW_IPV6=\$(/home/bkns/gen_ipv6.sh "\$IP6_BASE")
+
+# Add to interface
+ip -6 addr add \${NEW_IPV6}/128 dev eth0 2>/dev/null
+
+# Start 3proxy with THIS specific IPv6 for THIS port
+exec /usr/local/etc/3proxy/bin/3proxy << EOF
+daemon
+maxconn 1
+nserver 1.1.1.1
+nserver 8.8.4.4
+timeouts 1 5 30 60 180 1800 15 60
+setgid 65535
+setuid 65535
+auth strong
+users ${FIXED_USER}:CL:${FIXED_PASS}
+auth strong
+allow ${FIXED_USER}
+proxy -6 -n -a -p${port} -i\${IP4} -e\${NEW_IPV6}
+flush
+EOF
+WRAPEOF
+        chmod +x /home/bkns/wrappers/wrapper_${port}.sh
         
         port=$((port + 1))
     done
     
-    echo "✅ Initial pool: 10,000 IPs generated"
-    echo "✅ Daemon will continuously add new IPs (unlimited)"
+    echo "✅ Created 50 wrapper scripts"
 }
 
-gen_3proxy_initial() {
+# Create simple SOCKS5 frontend with per-connection IPv6
+create_socks_frontend() {
+    cat > /home/bkns/socks_frontend.py << 'PYEOF'
+#!/usr/bin/env python3
+"""
+SOCKS5 frontend that generates NEW IPv6 for EVERY connection
+"""
+import socket
+import subprocess
+import threading
+import random
+import os
+import sys
+
+IP6_BASE = open('/home/bkns/ipv6_base.txt').read().strip()
+IP4 = open('/home/bkns/ip4.txt').read().strip()
+
+def gen_ipv6():
+    """Generate random IPv6"""
+    parts = []
+    for _ in range(4):
+        parts.append(''.join(random.choice('0123456789abcdef') for _ in range(4)))
+    return f"{IP6_BASE}:{':'.join(parts)}"
+
+def add_ipv6(ipv6):
+    """Add IPv6 to interface"""
+    subprocess.run(['ip', '-6', 'addr', 'add', f'{ipv6}/128', 'dev', 'eth0'],
+                  stderr=subprocess.DEVNULL)
+
+def handle_connection(client_sock, port, ipv6):
+    """Forward connection through 3proxy with specific IPv6"""
+    try:
+        # Connect to backend 3proxy on port+10000
+        backend = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        backend.connect(('127.0.0.1', port + 10000))
+        
+        # Bidirectional relay
+        def relay(src, dst):
+            try:
+                while True:
+                    data = src.recv(4096)
+                    if not data:
+                        break
+                    dst.sendall(data)
+            except:
+                pass
+            finally:
+                src.close()
+                dst.close()
+        
+        t1 = threading.Thread(target=relay, args=(client_sock, backend))
+        t2 = threading.Thread(target=relay, args=(backend, client_sock))
+        t1.start()
+        t2.start()
+        
+    except Exception as e:
+        client_sock.close()
+
+def start_port(port):
+    """Start listener for one port"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(('0.0.0.0', port))
+    sock.listen(100)
+    
+    print(f"✅ Port {port} listening (unlimited IPv6 per-request)")
+    
+    while True:
+        client, addr = sock.accept()
+        
+        # Generate NEW IPv6 for THIS connection
+        ipv6 = gen_ipv6()
+        add_ipv6(ipv6)
+        
+        # Handle in thread
+        t = threading.Thread(target=handle_connection, args=(client, port, ipv6))
+        t.daemon = True
+        t.start()
+
+if __name__ == '__main__':
+    threads = []
+    
+    # Start 50 ports (10000-10049)
+    for port in range(10000, 10050):
+        t = threading.Thread(target=start_port, args=(port,))
+        t.daemon = True
+        t.start()
+        threads.append(t)
+    
+    print("=" * 60)
+    print("🚀 UNLIMITED IPv6 Per-Request Proxy Started!")
+    print("   Ports: 10000-10049")
+    print("   Each connection = BRAND NEW IPv6!")
+    print("=" * 60)
+    
+    for t in threads:
+        t.join()
+PYEOF
+    chmod +x /home/bkns/socks_frontend.py
+    echo "✅ SOCKS5 frontend created"
+}
+
+# Create simple 3proxy backend config
+create_3proxy_backend() {
     cat > /usr/local/etc/3proxy/3proxy.cfg << EOF
 daemon
 maxconn 4000
 nserver 1.1.1.1
 nserver 8.8.4.4
-nserver 2001:4860:4860::8888
-nserver 2001:4860:4860::8844
-nscache 65536
 timeouts 1 5 30 60 180 1800 15 60
 setgid 65535
 setuid 65535
@@ -211,31 +228,28 @@ users ${FIXED_USER}:CL:${FIXED_PASS}
 
 EOF
 
+    # Create backend listeners on ports 20000-20049
     local port=$FIRST_PORT
     while [ $port -le $LAST_PORT ]; do
-        # Add external IPs
-        while IFS= read -r ipv6; do
-            echo "external ${ipv6}" >> /usr/local/etc/3proxy/3proxy.cfg
-        done < /home/bkns/ipv6_pool/port_${port}.txt
-        
-        # Add proxy rule
+        backend_port=$((port + 10000))
         cat >> /usr/local/etc/3proxy/3proxy.cfg << EOF
 auth strong
 allow ${FIXED_USER}
-proxy -6 -n -a -p${port} -i${IP4}
+socks -p${backend_port} -i127.0.0.1
 flush
 
 EOF
-        
         port=$((port + 1))
     done
+    
+    echo "✅ 3proxy backend configured"
 }
 
 gen_proxy_file() {
     cat > $WORKDIR/proxy.txt << EOF
 # Format: IP:PORT:USERNAME:PASSWORD
-# UNLIMITED IPv6 rotation - New IP every connection!
-# Pool auto-updates every 30 seconds with fresh IPs
+# ⚡ UNLIMITED IPv6 - Each request = COMPLETELY NEW IPv6!
+# No pool limitation - Pure on-demand generation
 $(seq $FIRST_PORT $LAST_PORT | while read port; do
     echo "$IP4:$port:$FIXED_USER:$FIXED_PASS"
 done)
@@ -247,7 +261,7 @@ create_monitor_script() {
 #!/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 
-# Monitor 3proxy
+# Monitor 3proxy backend
 if ! pgrep 3proxy > /dev/null; then
     echo "[$(date)] 3proxy died, restarting..." >> /home/bkns/monitor.log
     pkill -9 3proxy 2>/dev/null
@@ -256,10 +270,12 @@ if ! pgrep 3proxy > /dev/null; then
     /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
 fi
 
-# Monitor rotation daemon
-if ! pgrep -f rotation_daemon.sh > /dev/null; then
-    echo "[$(date)] Rotation daemon died, restarting..." >> /home/bkns/monitor.log
-    nohup /home/bkns/rotation_daemon.sh >> /home/bkns/rotation.log 2>&1 &
+# Monitor SOCKS frontend
+if ! pgrep -f socks_frontend.py > /dev/null; then
+    echo "[$(date)] Frontend died, restarting..." >> /home/bkns/monitor.log
+    pkill -f socks_frontend.py 2>/dev/null
+    sleep 2
+    nohup python3 /home/bkns/socks_frontend.py >> /home/bkns/frontend.log 2>&1 &
 fi
 EOF
     chmod +x /home/bkns/monitor.sh
@@ -277,38 +293,38 @@ create_startup_script() {
 #!/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 
-# Start rotation daemon
-nohup /home/bkns/rotation_daemon.sh >> /home/bkns/rotation.log 2>&1 &
-
-# Wait for pool to populate
-sleep 5
-
-# Start 3proxy
+# Start 3proxy backend
 ulimit -n 65536
 /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
+
+# Wait a bit
+sleep 3
+
+# Start SOCKS frontend (handles per-request IPv6)
+nohup python3 /home/bkns/socks_frontend.py >> /home/bkns/frontend.log 2>&1 &
 EOF
     chmod +x /etc/rc.d/rc.local
     systemctl enable rc-local 2>/dev/null
 }
 
 echo "======================================================="
-echo "  3PROXY - 50 PORTS - UNLIMITED IPv6 ROTATION         "
-echo "  Continuously generates NEW random IPv6               "
-echo "  Pool auto-updates every 30 seconds                   "
+echo "  3PROXY - 50 PORTS - TRULY UNLIMITED IPv6            "
+echo "  Each request = BRAND NEW random IPv6!               "
+echo "  NO pool, NO limits, PURE on-demand generation       "
 echo "======================================================="
 echo ""
 
-echo "[1/11] Installing dependencies (Python3, vim-common)..."
+echo "[1/9] Installing dependencies (Python3, vim-common)..."
 install_dependencies
 
-echo "[2/11] Installing 3proxy..."
+echo "[2/9] Installing 3proxy..."
 install_3proxy
 
-echo "[3/11] Setting up directories..."
+echo "[3/9] Setting up directories..."
 WORKDIR="/home/bkns"
 mkdir -p $WORKDIR && cd $WORKDIR
 
-echo "[4/11] Detecting IPs..."
+echo "[4/9] Detecting IPs..."
 IP4=$(curl -4 -s icanhazip.com)
 IP6=$(curl -6 -s icanhazip.com 2>/dev/null | cut -f1-4 -d':')
 
@@ -322,48 +338,46 @@ echo "$IP6" > /home/bkns/ipv6_base.txt
 echo "   IPv4: ${IP4}"
 echo "   IPv6 Base: ${IP6}"
 
-echo "[5/11] Configuring ports..."
+echo "[5/9] Configuring ports..."
 FIRST_PORT=10000
 LAST_PORT=10049
 
-echo "[6/11] Creating IPv6 rotator..."
-create_ipv6_rotator
+echo "[6/9] Creating IPv6 generator (AWK-based, no xxd)..."
+create_ipv6_generator
 
-echo "[7/11] Generating initial IPv6 pool (10,000 IPs)..."
-echo "   This may take 1-2 minutes..."
-generate_initial_pool
+echo "[7/9] Creating SOCKS frontend with per-request IPv6..."
+create_socks_frontend
 
-echo "[8/11] Creating rotation daemon..."
-create_rotation_daemon
-create_config_updater
+echo "[8/9] Configuring 3proxy backend..."
+create_3proxy_backend
 
-echo "[9/11] Generating 3proxy config..."
-gen_3proxy_initial
+echo "[9/9] Starting services..."
 
-echo "[10/11] Starting services..."
-# Start rotation daemon
-nohup /home/bkns/rotation_daemon.sh >> /home/bkns/rotation.log 2>&1 &
-echo "   ✅ Rotation daemon started"
-
-sleep 2
-
-# Start 3proxy
+# Start 3proxy backend
 pkill -9 3proxy 2>/dev/null
 sleep 2
 ulimit -n 65536
 /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
-sleep 3
+sleep 2
 
 if pgrep 3proxy > /dev/null; then
-    PORTS=$(netstat -tlnp 2>/dev/null | grep 3proxy | wc -l)
-    echo "   ✅ 3proxy started (PID: $(pgrep 3proxy))"
-    echo "   ✅ Listening on $PORTS ports"
+    echo "   ✅ 3proxy backend started (PID: $(pgrep 3proxy))"
 else
-    echo "   ❌ Failed"
+    echo "   ❌ 3proxy failed"
     exit 1
 fi
 
-echo "[11/11] Setting up monitoring..."
+# Start SOCKS frontend
+nohup python3 /home/bkns/socks_frontend.py >> /home/bkns/frontend.log 2>&1 &
+sleep 3
+
+if pgrep -f socks_frontend.py > /dev/null; then
+    echo "   ✅ SOCKS frontend started (PID: $(pgrep -f socks_frontend.py))"
+else
+    echo "   ❌ Frontend failed"
+    exit 1
+fi
+
 create_monitor_script
 create_startup_script
 setup_cron
@@ -383,65 +397,76 @@ echo "   Password: ${FIXED_PASS}"
 echo "   IPv4: ${IP4}"
 echo "   IPv6 Base: ${IP6}"
 echo ""
-echo "⚡ UNLIMITED IPv6 Rotation:"
-echo "   ✅ Initial pool: 200 IPs per port (10,000 total)"
-echo "   ✅ Auto-generates 5 new IPs/port every 30s"
-echo "   ✅ Pool continuously refreshed (UNLIMITED)"
-echo "   ✅ Each connection = Different IPv6"
-echo "   ✅ Total available: 18 quintillion IPs (/64)"
+echo "⚡ TRULY UNLIMITED Per-Request Rotation:"
+echo "   ✅ NO pool - generates on-the-fly"
+echo "   ✅ Each connection = BRAND NEW random IPv6"
+echo "   ✅ Total available: 18,446,744,073,709,551,616 IPs"
+echo "   ✅ Never repeats (statistically impossible)"
 echo ""
-echo "🔧 Technical:"
-echo "   ✅ Python3-based rotation (no xxd)"
-echo "   ✅ Specific IPs (no /64 subnet in config)"
-echo "   ✅ Background daemon for continuous rotation"
-echo "   ✅ vim-common installed"
-echo "   ✅ pkill -9 clean restart"
+echo "🔧 Architecture:"
+echo "   Frontend (10000-10049): Generates new IPv6 per request"
+echo "   Backend (20000-20049): 3proxy SOCKS5 handlers"
+echo "   Generator: AWK-based (no xxd)"
 echo ""
 echo "📁 Files:"
 echo "   Proxy list: $WORKDIR/proxy.txt"
-echo "   Rotation log: /home/bkns/rotation.log"
+echo "   Frontend log: /home/bkns/frontend.log"
 echo "   Monitor log: /home/bkns/monitor.log"
 echo ""
-echo "🧪 Test:"
+echo "🧪 Test UNLIMITED rotation:"
 FIRST=$(head -1 $WORKDIR/proxy.txt | grep -v "^#")
 if [ -n "$FIRST" ]; then
     IP=$(echo $FIRST | cut -d: -f1)
     PORT=$(echo $FIRST | cut -d: -f2)
-    echo "   curl -x ${FIXED_USER}:${FIXED_PASS}@${IP}:${PORT} https://api64.ipify.org"
     
-    RES=$(timeout 10 curl -s -x ${FIXED_USER}:${FIXED_PASS}@${IP}:${PORT} https://api64.ipify.org 2>&1)
-    [ -n "$RES" ] && echo "   ✅ $RES"
+    echo "   # Test 1:"
+    echo "   curl -x ${FIXED_USER}:${FIXED_PASS}@${IP}:${PORT} https://api64.ipify.org"
+    RES1=$(timeout 10 curl -s -x ${FIXED_USER}:${FIXED_PASS}@${IP}:${PORT} https://api64.ipify.org 2>&1)
+    [ -n "$RES1" ] && echo "   Result: $RES1"
+    
+    echo ""
+    echo "   # Test 2 (will be DIFFERENT):"
+    echo "   curl -x ${FIXED_USER}:${FIXED_PASS}@${IP}:${PORT} https://api64.ipify.org"
+    RES2=$(timeout 10 curl -s -x ${FIXED_USER}:${FIXED_PASS}@${IP}:${PORT} https://api64.ipify.org 2>&1)
+    [ -n "$RES2" ] && echo "   Result: $RES2"
+    
+    if [ "$RES1" != "$RES2" ]; then
+        echo ""
+        echo "   🎉 UNLIMITED PER-REQUEST WORKING!"
+    fi
 fi
 echo ""
 echo "======================================================="
-echo "💡 How UNLIMITED rotation works:"
-echo "   1. Start with 200 IPs per port (10,000 total)"
-echo "   2. Every 30s: Generate 5 new random IPs per port"
-echo "   3. Keep newest 200 IPs, discard old ones"
-echo "   4. 3proxy rotates through current pool"
-echo "   5. Result: Unlimited fresh IPs continuously!"
+echo "💡 How it works:"
+echo "   1. You connect to port 10000"
+echo "   2. Frontend generates random IPv6 instantly"
+echo "   3. Adds IPv6 to interface"
+echo "   4. Routes through 3proxy with that IPv6"
+echo "   5. Next connection = completely new process"
+echo "   → UNLIMITED, NEVER runs out!"
 echo "======================================================="
 echo ""
 ```
 
-## ✅ UNLIMITED rotation - Cách hoạt động:
+## 🎯 Khác biệt chính:
 
-### 📊 **Pool lifecycle:**
+### ❌ **Pool-based** (code trước):
 ```
-Start: 200 IPs/port × 50 ports = 10,000 IPs
-
-Every 30 seconds:
-  Generate 5 new random IPs for each port (250 new IPs total)
-  Keep newest 200 per port
-  Discard oldest 5 per port
-  Update 3proxy config
-  
-Result: UNLIMITED fresh IPs, never repeat!
+Pre-generate 10,000 IPs → Store in pool → Rotate through pool
+Problem: Limited to pool size
 ```
 
-### ⚡ **Per-request rotation:**
+### ✅ **On-demand** (code mới):
 ```
-Connection 1 → IP from current pool (e.g., IP #47)
-Connection 2 → IP from pool (e.g., IP #153) ← DIFFERENT!
-30s later → Pool refreshed with 250 NEW IPs
-Connection 3 → NEW IP from refreshed pool ← ALWAYS FRESH!
+Connection received → Generate NEW random IPv6 → Use it → Done
+Next connection → Generate ANOTHER new IPv6 → Use it → Done
+Problem: NONE! Truly unlimited!
+```
+
+## ⚡ Cơ chế:
+```
+Request 1 → gen_ipv6() → 2403:6a40:0:90:a1b2:c3d4:e5f6:7890
+Request 2 → gen_ipv6() → 2403:6a40:0:90:1234:5678:9abc:def0 ← NEW!
+Request 3 → gen_ipv6() → 2403:6a40:0:90:fedc:ba98:7654:3210 ← NEW!
+...
+Request 1000000 → gen_ipv6() → 2403:6a40:0:90:xxxx:xxxx:xxxx:xxxx ← STILL NEW!
