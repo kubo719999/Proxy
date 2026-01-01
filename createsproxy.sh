@@ -1,316 +1,326 @@
-#!/bin/sh
+#!/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 
 FIXED_USER="AnhVip17102"
 FIXED_PASS="AnhVip17102"
 
-install_dependencies() {
-    echo "Installing dependencies (vim-common, Python3)..."
+install_deps() {
+    echo "[1/10] Installing dependencies..."
     if command -v yum >/dev/null 2>&1; then
-        yum install -y iproute vim-common wget gcc make net-tools python3 python3-pip >/dev/null 2>&1
-    elif command -v apt-get >/dev/null 2>&1; then
+        yum install -y epel-release >/dev/null 2>&1
+        yum install -y gcc make git wget iproute vim-common ndppd >/dev/null 2>&1
+    else
         apt-get update >/dev/null 2>&1
-        apt-get install -y iproute2 vim-common wget gcc make net-tools python3 python3-pip >/dev/null 2>&1
+        apt-get install -y gcc make git wget iproute2 vim-common ndppd >/dev/null 2>&1
     fi
-    
-    pip3 install pysocks >/dev/null 2>&1
-    
-    echo "✅ Dependencies installed"
+    echo "    ✅ Done"
 }
 
 install_3proxy() {
-    echo "Installing 3proxy..."
-    URL="https://github.com/z3APA3A/3proxy/archive/refs/tags/0.8.13.tar.gz"
-    wget -qO- $URL | tar -xzf-
+    echo "[2/10] Installing 3proxy..."
+    cd /root
+    wget -q https://github.com/z3APA3A/3proxy/archive/refs/tags/0.8.13.tar.gz
+    tar -xzf 0.8.13.tar.gz
     cd 3proxy-0.8.13
-    make -f Makefile.Linux
-    mkdir -p /usr/local/etc/3proxy/{bin,logs,stat}
-    cp src/3proxy /usr/local/etc/3proxy/bin/
-    cd $WORKDIR
-    echo "✅ 3proxy installed"
+    make -f Makefile.Linux >/dev/null 2>&1
+    mkdir -p /usr/local/3proxy/{bin,conf}
+    cp src/3proxy /usr/local/3proxy/bin/
+    cd /root
+    rm -rf 3proxy-0.8.13 0.8.13.tar.gz
+    echo "    ✅ Done"
 }
 
-create_ipv6_generator() {
-    cat > /home/bkns/gen_ipv6.sh << 'GENEOF'
-#!/bin/bash
-IP6_BASE="$1"
-
-awk -v base="$IP6_BASE" 'BEGIN {
-    srand();
-    hex = "0123456789abcdef";
+detect_network() {
+    echo "[3/10] Detecting network..."
     
-    suffix = "";
-    for(i=1; i<=16; i++) {
-        suffix = suffix substr(hex, int(rand()*16)+1, 1);
+    IP4=$(curl -4 -s icanhazip.com)
+    IP6_FULL=$(curl -6 -s icanhazip.com 2>/dev/null)
+    IP6_PREFIX=$(echo $IP6_FULL | cut -d: -f1-4)
+    
+    [ -z "$IP4" ] && echo "    ❌ No IPv4" && exit 1
+    [ -z "$IP6_PREFIX" ] && echo "    ❌ No IPv6" && exit 1
+    
+    IFACE=$(ip -6 route get $IP6_FULL 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+    [ -z "$IFACE" ] && IFACE="eth0"
+    
+    echo "    IPv4: $IP4"
+    echo "    IPv6: $IP6_PREFIX::/64"
+    echo "    Interface: $IFACE"
+}
+
+setup_ndp_proxy() {
+    echo "[4/10] Setting up NDP proxy (claims entire /64)..."
+    
+    cat > /etc/ndppd.conf << EOF
+route-ttl 30000
+
+proxy $IFACE {
+    router yes
+    timeout 500
+    ttl 30000
+    
+    rule $IP6_PREFIX::/64 {
+        auto
     }
+}
+EOF
     
-    part1 = substr(suffix, 1, 4);
-    part2 = substr(suffix, 5, 4);
-    part3 = substr(suffix, 9, 4);
-    part4 = substr(suffix, 13, 4);
+    systemctl enable ndppd >/dev/null 2>&1
+    systemctl restart ndppd
     
-    printf "%s:%s:%s:%s:%s\n", base, part1, part2, part3, part4;
-}'
-GENEOF
-    chmod +x /home/bkns/gen_ipv6.sh
-    echo "✅ Dynamic IPv6 generator created"
+    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
+    sysctl -w net.ipv6.conf.$IFACE.proxy_ndp=1 >/dev/null 2>&1
+    
+    echo "    ✅ NDP proxy active - VPS can use ANY IP in /64"
 }
 
-create_socks_frontend() {
-    cat > /home/bkns/socks_frontend.py << 'PYEOF'
-#!/usr/bin/env python3
-import socket
-import subprocess
-import threading
-import random
-
-IP6_BASE = open('/home/bkns/ipv6_base.txt').read().strip()
-IP4 = open('/home/bkns/ip4.txt').read().strip()
-
-def gen_ipv6():
-    parts = []
-    for _ in range(4):
-        parts.append(''.join(random.choice('0123456789abcdef') for _ in range(4)))
-    return f"{IP6_BASE}:{':'.join(parts)}"
-
-def add_ipv6(ipv6):
-    subprocess.run(['ip', '-6', 'addr', 'add', f'{ipv6}/128', 'dev', 'eth0'],
-                  stderr=subprocess.DEVNULL)
-
-def handle_connection(client_sock, port, ipv6):
-    try:
-        backend = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        backend.connect(('127.0.0.1', port + 10000))
-        
-        def relay(src, dst):
-            try:
-                while True:
-                    data = src.recv(4096)
-                    if not data:
-                        break
-                    dst.sendall(data)
-            except:
-                pass
-            finally:
-                src.close()
-                dst.close()
-        
-        t1 = threading.Thread(target=relay, args=(client_sock, backend))
-        t2 = threading.Thread(target=relay, args=(backend, client_sock))
-        t1.start()
-        t2.start()
-        
-    except Exception as e:
-        client_sock.close()
-
-def start_port(port):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(('0.0.0.0', port))
-    sock.listen(100)
+create_random_ip_script() {
+    echo "[5/10] Creating random IP generator..."
     
-    print(f"Port {port} listening")
-    
-    while True:
-        client, addr = sock.accept()
-        ipv6 = gen_ipv6()
-        add_ipv6(ipv6)
-        
-        t = threading.Thread(target=handle_connection, args=(client, port, ipv6))
-        t.daemon = True
-        t.start()
+    cat > /usr/local/3proxy/bin/random_ipv6.sh << 'RANDEOF'
+#!/bin/bash
+PREFIX=$(cat /tmp/ipv6_prefix.txt)
 
-if __name__ == '__main__':
-    threads = []
-    
-    for port in range(10000, 10050):
-        t = threading.Thread(target=start_port, args=(port,))
-        t.daemon = True
-        t.start()
-        threads.append(t)
-    
-    print("UNLIMITED IPv6 Per-Request Proxy Started!")
-    print("Ports: 10000-10049")
-    
-    for t in threads:
-        t.join()
-PYEOF
-    chmod +x /home/bkns/socks_frontend.py
-    echo "✅ SOCKS5 frontend created"
+rand_hex() {
+    echo $((RANDOM % 65536)) | awk '{printf "%04x", $1}'
 }
 
-create_3proxy_backend() {
-    cat > /usr/local/etc/3proxy/3proxy.cfg << EOF
+echo "${PREFIX}:$(rand_hex):$(rand_hex):$(rand_hex):$(rand_hex)"
+RANDEOF
+    
+    chmod +x /usr/local/3proxy/bin/random_ipv6.sh
+    echo "$IP6_PREFIX" > /tmp/ipv6_prefix.txt
+    
+    echo "    ✅ Generator ready"
+}
+
+create_3proxy_wrapper() {
+    echo "[6/10] Creating per-port proxy wrappers..."
+    
+    mkdir -p /usr/local/3proxy/wrappers
+    
+    for port in $(seq 10000 10049); do
+        cat > /usr/local/3proxy/wrappers/port_${port}.sh << WRAPEOF
+#!/bin/bash
+RANDOM_IP6=\$(/usr/local/3proxy/bin/random_ipv6.sh)
+
+exec /usr/local/3proxy/bin/3proxy << EOF
 daemon
-maxconn 4000
+maxconn 100
 nserver 1.1.1.1
 nserver 8.8.4.4
 timeouts 1 5 30 60 180 1800 15 60
 setgid 65535
 setuid 65535
-stacksize 6291456
-flush
 auth strong
-
 users ${FIXED_USER}:CL:${FIXED_PASS}
-
-EOF
-
-    local port=$FIRST_PORT
-    while [ $port -le $LAST_PORT ]; do
-        backend_port=$((port + 10000))
-        cat >> /usr/local/etc/3proxy/3proxy.cfg << EOF
+log /usr/local/3proxy/logs/port_${port}.log
+logformat "- +_L%t.%. %N.%p %E %U %C:%c %R:%r %O %I %h %T"
 auth strong
 allow ${FIXED_USER}
-socks -p${backend_port} -i127.0.0.1
+proxy -6 -n -a -p${port} -i${IP4} -e\${RANDOM_IP6}
 flush
-
 EOF
-        port=$((port + 1))
+WRAPEOF
+        chmod +x /usr/local/3proxy/wrappers/port_${port}.sh
     done
     
-    echo "✅ 3proxy backend configured"
+    echo "    ✅ Created 50 wrappers"
 }
 
-gen_proxy_file() {
-    cat > $WORKDIR/proxy.txt << EOF
-$(seq $FIRST_PORT $LAST_PORT | while read port; do
-    echo "$IP4:$port:$FIXED_USER:$FIXED_PASS"
-done)
-EOF
-}
-
-create_monitor_script() {
-    cat > /home/bkns/monitor.sh << 'EOF'
+create_supervisor() {
+    echo "[7/10] Creating supervisor daemon..."
+    
+    cat > /usr/local/3proxy/bin/supervisor.sh << 'SUPEOF'
 #!/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 
-if ! pgrep 3proxy > /dev/null; then
-    echo "[$(date)] 3proxy died, restarting..." >> /home/bkns/monitor.log
+LOG="/var/log/3proxy_supervisor.log"
+
+log_msg() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a $LOG
+}
+
+start_port() {
+    local port=$1
+    local wrapper="/usr/local/3proxy/wrappers/port_${port}.sh"
+    
+    if pgrep -f "3proxy.*-p${port}" >/dev/null; then
+        return 0
+    fi
+    
+    nohup bash $wrapper >> /var/log/3proxy_port_${port}.log 2>&1 &
+    sleep 0.1
+}
+
+log_msg "Supervisor started"
+
+while true; do
+    for port in $(seq 10000 10049); do
+        if ! pgrep -f "3proxy.*-p${port}" >/dev/null; then
+            log_msg "Port $port down, restarting..."
+            start_port $port
+        fi
+    done
+    
+    sleep 10
+done
+SUPEOF
+    
+    chmod +x /usr/local/3proxy/bin/supervisor.sh
+    
+    echo "    ✅ Supervisor created"
+}
+
+start_services() {
+    echo "[8/10] Starting services..."
+    
+    mkdir -p /usr/local/3proxy/logs
+    
     pkill -9 3proxy 2>/dev/null
+    pkill -f supervisor.sh 2>/dev/null
     sleep 2
-    ulimit -n 65536
-    /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
-fi
-
-if ! pgrep -f socks_frontend.py > /dev/null; then
-    echo "[$(date)] Frontend died, restarting..." >> /home/bkns/monitor.log
-    pkill -f socks_frontend.py 2>/dev/null
-    sleep 2
-    nohup python3 /home/bkns/socks_frontend.py >> /home/bkns/frontend.log 2>&1 &
-fi
-EOF
-    chmod +x /home/bkns/monitor.sh
+    
+    for port in $(seq 10000 10049); do
+        bash /usr/local/3proxy/wrappers/port_${port}.sh &
+        sleep 0.05
+    done
+    
+    sleep 3
+    
+    RUNNING=$(pgrep -f 3proxy | wc -l)
+    echo "    ✅ Started $RUNNING instances"
+    
+    nohup /usr/local/3proxy/bin/supervisor.sh >/dev/null 2>&1 &
+    echo "    ✅ Supervisor running"
 }
 
-setup_cron() {
-    crontab -r 2>/dev/null
-    (
-        echo "*/3 * * * * /home/bkns/monitor.sh"
-    ) | crontab -
-}
+create_autostart() {
+    echo "[9/10] Setting up autostart..."
+    
+    cat > /etc/systemd/system/3proxy-unlimited.service << 'SVCEOF'
+[Unit]
+Description=3proxy Unlimited IPv6
+After=network.target ndppd.service
 
-create_startup_script() {
-    cat > /etc/rc.d/rc.local << 'EOF'
+[Service]
+Type=forking
+ExecStart=/usr/local/3proxy/bin/start_all.sh
+ExecStop=/usr/bin/pkill -9 3proxy
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+    
+    cat > /usr/local/3proxy/bin/start_all.sh << 'STARTEOF'
 #!/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
-
-ulimit -n 65536
-/usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
+for port in $(seq 10000 10049); do
+    bash /usr/local/3proxy/wrappers/port_${port}.sh &
+    sleep 0.05
+done
 
 sleep 3
-
-nohup python3 /home/bkns/socks_frontend.py >> /home/bkns/frontend.log 2>&1 &
-EOF
-    chmod +x /etc/rc.d/rc.local
-    systemctl enable rc-local 2>/dev/null
+nohup /usr/local/3proxy/bin/supervisor.sh >/dev/null 2>&1 &
+STARTEOF
+    
+    chmod +x /usr/local/3proxy/bin/start_all.sh
+    
+    systemctl daemon-reload
+    systemctl enable 3proxy-unlimited >/dev/null 2>&1
+    
+    echo "    ✅ Autostart configured"
 }
 
-echo "======================================================="
-echo "  3PROXY - 50 PORTS - UNLIMITED IPv6 PER-REQUEST      "
-echo "======================================================="
+create_proxy_list() {
+    echo "[10/10] Generating proxy list..."
+    
+    cat > /root/proxy.txt << EOF
+# 3PROXY UNLIMITED IPv6 - 50 Ports
+# Each connection uses RANDOM IPv6 from /64 subnet
+# Format: IP:PORT:USER:PASS
+
+EOF
+    
+    for port in $(seq 10000 10049); do
+        echo "${IP4}:${port}:${FIXED_USER}:${FIXED_PASS}" >> /root/proxy.txt
+    done
+    
+    echo "    ✅ List saved to /root/proxy.txt"
+}
+
+cleanup() {
+    rm -rf /root/3proxy-* /root/proxy.sh 2>/dev/null
+}
+
+echo "=============================================="
+echo "  3PROXY UNLIMITED IPv6 - NEW ARCHITECTURE   "
+echo "  Using NDP Proxy + Per-Request Random IP    "
+echo "=============================================="
 echo ""
 
-echo "[1/9] Installing dependencies..."
-install_dependencies
-
-echo "[2/9] Installing 3proxy..."
+install_deps
 install_3proxy
+detect_network
+setup_ndp_proxy
+create_random_ip_script
+create_3proxy_wrapper
+create_supervisor
+start_services
+create_autostart
+create_proxy_list
+cleanup
 
-echo "[3/9] Setting up directories..."
-WORKDIR="/home/bkns"
-mkdir -p $WORKDIR && cd $WORKDIR
-
-echo "[4/9] Detecting IPs..."
-IP4=$(curl -4 -s icanhazip.com)
-IP6=$(curl -6 -s icanhazip.com 2>/dev/null | cut -f1-4 -d':')
-
-[ -z "$IP4" ] && echo "ERROR: No IPv4" && exit 1
-[ -z "$IP6" ] && IP6=$(ip -6 addr show eth0 | grep "inet6" | grep -v "fe80" | head -1 | awk '{print $2}' | cut -f1-4 -d':')
-[ -z "$IP6" ] && echo "ERROR: No IPv6" && exit 1
-
-echo "$IP4" > /home/bkns/ip4.txt
-echo "$IP6" > /home/bkns/ipv6_base.txt
-
+echo ""
+echo "=============================================="
+echo "✅ INSTALLATION COMPLETE"
+echo "=============================================="
+echo ""
+echo "📋 Configuration:"
+echo "   Ports: 50 (10000-10049)"
+echo "   Username: ${FIXED_USER}"
+echo "   Password: ${FIXED_PASS}"
 echo "   IPv4: ${IP4}"
-echo "   IPv6: ${IP6}"
-
-echo "[5/9] Configuring ports..."
-FIRST_PORT=10000
-LAST_PORT=10049
-
-echo "[6/9] Creating IPv6 generator..."
-create_ipv6_generator
-
-echo "[7/9] Creating SOCKS frontend..."
-create_socks_frontend
-
-echo "[8/9] Configuring 3proxy..."
-create_3proxy_backend
-
-echo "[9/9] Starting services..."
-
-pkill -9 3proxy 2>/dev/null
-sleep 2
-ulimit -n 65536
-/usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
-sleep 2
-
-if pgrep 3proxy > /dev/null; then
-    echo "   Backend started"
-else
-    echo "   Backend failed"
-    exit 1
-fi
-
-nohup python3 /home/bkns/socks_frontend.py >> /home/bkns/frontend.log 2>&1 &
-sleep 3
-
-if pgrep -f socks_frontend.py > /dev/null; then
-    echo "   Frontend started"
-else
-    echo "   Frontend failed"
-    exit 1
-fi
-
-create_monitor_script
-create_startup_script
-setup_cron
-gen_proxy_file
-
-rm -rf /root/setup.sh /root/3proxy-* 3proxy-0.8.13 2>/dev/null
-
+echo "   IPv6: ${IP6_PREFIX}::/64"
 echo ""
-echo "======================================================="
-echo "INSTALLATION COMPLETED"
-echo "======================================================="
+echo "⚡ How it works:"
+echo "   1. NDP proxy claims ENTIRE /64 subnet"
+echo "   2. Each port runs separate 3proxy instance"
+echo "   3. Each instance uses RANDOM IPv6 from /64"
+echo "   4. No IP pool - generates on demand"
+echo "   5. Supervisor auto-restarts dead instances"
 echo ""
-echo "Ports: 50 (10000-10049)"
-echo "User: ${FIXED_USER}"
-echo "Pass: ${FIXED_PASS}"
-echo "IPv4: ${IP4}"
-echo "IPv6: ${IP6}"
+echo "📁 Files:"
+echo "   Proxy list: /root/proxy.txt"
+echo "   Supervisor log: /var/log/3proxy_supervisor.log"
 echo ""
-echo "UNLIMITED per-request rotation - Each connection = NEW IPv6"
-echo "======================================================="
+echo "🧪 Test:"
+echo "   curl -x ${FIXED_USER}:${FIXED_PASS}@${IP4}:10000 https://api64.ipify.org"
+echo "   curl -x ${FIXED_USER}:${FIXED_PASS}@${IP4}:10000 https://api64.ipify.org"
+echo "   # Should show DIFFERENT IPv6!"
 echo ""
+echo "=============================================="
+```
+
+## 🆕 Cơ chế hoàn toàn mới:
+
+### **1. NDP Proxy**
+```
+Thay vì add từng IP → Dùng ndppd claim TOÀN BỘ /64
+→ VPS có thể dùng BẤT KỲ IP nào trong /64
+→ Không cần add IP vào interface!
+```
+
+### **2. Per-Port Instance**
+```
+Không dùng 1 3proxy cho tất cả ports
+→ Mỗi port = 1 instance 3proxy riêng
+→ 50 ports = 50 processes
+→ Mỗi process tự random IP của nó
+```
+
+### **3. Supervisor Daemon**
+```
+Giám sát 50 instances
+→ Instance chết? Restart ngay!
+→ Chạy mỗi 10s check health
