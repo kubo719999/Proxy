@@ -1,7 +1,6 @@
 #!/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 
-# Fixed credentials
 FIXED_USER="AnhVip17102"
 FIXED_PASS="AnhVip17102"
 
@@ -21,7 +20,7 @@ install_dependencies() {
         apt-get update >/dev/null 2>&1
         apt-get install -y iproute2 vim-common wget gcc make net-tools >/dev/null 2>&1
     fi
-    echo "✅ Dependencies installed"
+    echo "Dependencies installed"
 }
 
 install_3proxy() {
@@ -33,7 +32,7 @@ install_3proxy() {
     mkdir -p /usr/local/etc/3proxy/{bin,logs,stat}
     cp src/3proxy /usr/local/etc/3proxy/bin/
     cd $WORKDIR
-    echo "✅ 3proxy installed"
+    echo "3proxy installed"
 }
 
 gen_3proxy() {
@@ -93,24 +92,20 @@ log_msg() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a $LOGFILE
 }
 
-# Auto-cleanup log
 if [ -f "$LOGFILE" ]; then
     LOG_SIZE=$(du -m "$LOGFILE" 2>/dev/null | cut -f1)
     [ "$LOG_SIZE" -gt 10 ] && tail -n 1000 "$LOGFILE" > "${LOGFILE}.tmp" && mv "${LOGFILE}.tmp" "$LOGFILE"
 fi
 
-log_msg "========== Rotation Start (Strict IP Control) =========="
+log_msg "========== Rotation Start =========="
 
-# Get IPv6 prefix
 IP6=$(head -1 $WORKDATA 2>/dev/null | cut -d'/' -f5 | cut -f1-4 -d':')
-[ -z "$IP6" ] && log_msg "❌ ERROR: No IPv6 prefix" && exit 1
+[ -z "$IP6" ] && log_msg "ERROR: No IPv6" && exit 1
 
 log_msg "IPv6 Prefix: $IP6"
 
-# Backup
 cp $WORKDATA ${WORKDATA}.backup
 
-# Generate NEW IPv6
 awk -v ip6="$IP6" -v user="$FIXED_USER" -v pass="$FIXED_PASS" -F "/" '
 BEGIN {
     srand();
@@ -131,31 +126,23 @@ BEGIN {
     print user "/" pass "/" $3 "/" $4 "/" new_ip6;
 }' $WORKDATA > ${WORKDATA}.new
 
-if [ ! -s ${WORKDATA}.new ]; then
-    log_msg "❌ ERROR: Failed to generate new IPs"
-    rm -f ${WORKDATA}.new
-    exit 1
-fi
+[ ! -s ${WORKDATA}.new ] && log_msg "ERROR: Gen failed" && exit 1
 
-log_msg "✅ Generated $(wc -l < ${WORKDATA}.new) new IPv6"
+log_msg "Generated $(wc -l < ${WORKDATA}.new) new IPv6"
 
-# CRITICAL: Save list of IPs to KEEP before any changes
-awk -F "/" '{print $5}' ${WORKDATA}.new > /tmp/keep_ips_$$.txt
-KEEP_COUNT=$(wc -l < /tmp/keep_ips_$$.txt)
+awk -F "/" '{print $5}' ${WORKDATA}.new | sort > /tmp/keep_ips.txt
+KEEP_COUNT=$(wc -l < /tmp/keep_ips.txt)
 log_msg "Will keep $KEEP_COUNT IPs"
 
-# Replace data
 mv ${WORKDATA}.new $WORKDATA
 
-# Add new IPs
-log_msg "Adding new IPv6 addresses..."
+log_msg "Adding new IPv6..."
 awk -F "/" '{system("ip -6 addr add " $5 "/64 dev eth0 2>/dev/null")}' ${WORKDATA}
-log_msg "✅ New IPs added"
+log_msg "New IPs added"
 
 sleep 2
 
-# Generate new config
-log_msg "Generating 3proxy config..."
+log_msg "Generating config..."
 cat > /usr/local/etc/3proxy/3proxy.cfg.new << 'EOFCFG'
 daemon
 maxconn 4000
@@ -183,12 +170,9 @@ awk -v user="$FIXED_USER" -F "/" '{
     print "";
 }' ${WORKDATA} >> /usr/local/etc/3proxy/3proxy.cfg.new
 
-log_msg "✅ Config generated"
-
-# Atomic swap
 mv /usr/local/etc/3proxy/3proxy.cfg.new /usr/local/etc/3proxy/3proxy.cfg
+log_msg "Config generated"
 
-# Reload 3proxy
 log_msg "Reloading 3proxy..."
 OLD_PID=$(pgrep 3proxy)
 
@@ -198,7 +182,7 @@ if [ -n "$OLD_PID" ]; then
     sleep 5
     
     if ! pgrep 3proxy > /dev/null; then
-        log_msg "HUP failed, clean restart..."
+        log_msg "HUP failed, restarting..."
         pkill -9 3proxy 2>/dev/null
         sleep 2
         ulimit -n 65536
@@ -206,64 +190,57 @@ if [ -n "$OLD_PID" ]; then
         sleep 3
     fi
 else
-    log_msg "No old instance, starting fresh..."
     ulimit -n 65536
     /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
     sleep 3
 fi
 
-if ! pgrep 3proxy > /dev/null; then
-    log_msg "❌ ERROR: 3proxy failed to start"
-    exit 1
-fi
+[ ! -n "$(pgrep 3proxy)" ] && log_msg "ERROR: 3proxy failed" && exit 1
+log_msg "3proxy running (PID: $(pgrep 3proxy))"
 
-log_msg "✅ 3proxy running (PID: $(pgrep 3proxy))"
-
-# CRITICAL: IMMEDIATE cleanup to prevent IP accumulation
-log_msg "IMMEDIATE cleanup (preventing IP accumulation)..."
+log_msg "IMMEDIATE cleanup (precise deletion)..."
 
 BEFORE=$(ip -6 addr show eth0 2>/dev/null | grep -c "inet6.*scope global")
+log_msg "Before cleanup: $BEFORE IPs"
+
+ip -6 addr show eth0 2>/dev/null | grep "inet6.*scope global" | awk '{print $2}' | cut -d'/' -f1 | sort > /tmp/all_ips.txt
+
+comm -23 /tmp/all_ips.txt /tmp/keep_ips.txt > /tmp/delete_ips.txt
+
 REMOVED=0
-KEPT=0
-
-# Delete ALL IPs not in keep list
-ip -6 addr show eth0 2>/dev/null | grep "inet6.*scope global" | awk '{print $2}' | cut -d'/' -f1 | while read ip; do
-    if grep -Fxq "$ip" /tmp/keep_ips_$$.txt; then
-        KEPT=$((KEPT + 1))
-    else
-        ip -6 addr del ${ip}/64 dev eth0 2>/dev/null
-        REMOVED=$((REMOVED + 1))
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Deleted old IP: $ip" >> ${LOGFILE}
-    fi
-done
-
-sleep 1
+while IFS= read -r ip; do
+    ip -6 addr del ${ip}/64 dev eth0 2>/dev/null && REMOVED=$((REMOVED + 1))
+done < /tmp/delete_ips.txt
 
 AFTER=$(ip -6 addr show eth0 2>/dev/null | grep -c "inet6.*scope global")
 
-log_msg "✅ Cleanup completed:"
+log_msg "Cleanup completed:"
 log_msg "   Before: $BEFORE IPs"
 log_msg "   After: $AFTER IPs"
+log_msg "   Removed: $REMOVED IPs"
 log_msg "   Target: $KEEP_COUNT IPs"
 
-# Cleanup temp file
-rm -f /tmp/keep_ips_$$.txt
+rm -f /tmp/keep_ips.txt /tmp/all_ips.txt /tmp/delete_ips.txt
 
-# Final verification
 PROXY_COUNT=$(wc -l < $WORKDATA)
 TOTAL_IPS=$(ip -6 addr show eth0 2>/dev/null | grep -c "inet6.*scope global")
 
 log_msg "========== Rotation Completed =========="
 log_msg "Active proxies: $PROXY_COUNT"
-log_msg "Total IPv6 on interface: $TOTAL_IPS"
+log_msg "Total IPv6: $TOTAL_IPS"
 log_msg "3proxy PID: $(pgrep 3proxy)"
 
-# Alert if IP count is wrong
-if [ "$TOTAL_IPS" -gt "$((PROXY_COUNT + 20))" ]; then
-    log_msg "⚠️  WARNING: Too many IPs ($TOTAL_IPS > $PROXY_COUNT)"
+if [ "$TOTAL_IPS" -ne "$PROXY_COUNT" ]; then
+    log_msg "WARNING: IP mismatch! Proxies=$PROXY_COUNT but IPs=$TOTAL_IPS"
+    log_msg "Running emergency fix..."
+    
+    awk -F "/" '{system("ip -6 addr add " $5 "/64 dev eth0 2>/dev/null")}' ${WORKDATA}
+    
+    FIXED=$(ip -6 addr show eth0 2>/dev/null | grep -c "inet6.*scope global")
+    log_msg "After fix: $FIXED IPs"
 fi
 
-log_msg "=========================================="
+log_msg "========================================"
 ROTEOF
 
     chmod +x /home/bkns/rotate_ipv6.sh
@@ -272,7 +249,6 @@ ROTEOF
 create_emergency_cleanup_script() {
     cat > /home/bkns/emergency_cleanup.sh << 'EMERGEOF'
 #!/bin/bash
-# Emergency cleanup - remove excess IPs immediately
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 
 LOGFILE="/home/bkns/emergency_cleanup.log"
@@ -284,50 +260,41 @@ log_msg() {
 
 log_msg "========== EMERGENCY CLEANUP =========="
 
-# Get current proxy IPs
-if [ ! -f "$CURRENT_IPS" ]; then
-    log_msg "ERROR: data.txt not found"
-    exit 1
-fi
+[ ! -f "$CURRENT_IPS" ] && log_msg "ERROR: data.txt not found" && exit 1
 
-awk -F "/" '{print $5}' $CURRENT_IPS > /tmp/keep_current.txt
+awk -F "/" '{print $5}' $CURRENT_IPS | sort > /tmp/keep_current.txt
 
 BEFORE=$(ip -6 addr show eth0 2>/dev/null | grep -c "inet6.*scope global")
 log_msg "IPv6 count before: $BEFORE"
 
 if [ "$BEFORE" -lt 200 ]; then
-    log_msg "IP count is normal ($BEFORE), no emergency cleanup needed"
+    log_msg "IP count normal, no emergency needed"
     rm -f /tmp/keep_current.txt
     exit 0
 fi
 
-log_msg "⚠️  WARNING: $BEFORE IPs detected - starting emergency cleanup"
+log_msg "WARNING: $BEFORE IPs - starting cleanup"
+
+ip -6 addr show eth0 2>/dev/null | grep "inet6.*scope global" | awk '{print $2}' | cut -d'/' -f1 | sort > /tmp/all_current.txt
+
+comm -23 /tmp/all_current.txt /tmp/keep_current.txt > /tmp/delete_emergency.txt
 
 REMOVED=0
-KEPT=0
+while IFS= read -r ip; do
+    ip -6 addr del ${ip}/64 dev eth0 2>/dev/null && REMOVED=$((REMOVED + 1))
+    [ $((REMOVED % 100)) -eq 0 ] && log_msg "Removed $REMOVED so far..."
+done < /tmp/delete_emergency.txt
 
-# Delete all old IPs
-ip -6 addr show eth0 2>/dev/null | grep "inet6.*scope global" | awk '{print $2}' | cut -d'/' -f1 | while read ip; do
-    if grep -Fxq "$ip" /tmp/keep_current.txt; then
-        KEPT=$((KEPT + 1))
-    else
-        ip -6 addr del ${ip}/64 dev eth0 2>/dev/null
-        REMOVED=$((REMOVED + 1))
-        [ $((REMOVED % 100)) -eq 0 ] && log_msg "Removed $REMOVED IPs so far..."
-    fi
-done
-
-rm -f /tmp/keep_current.txt
+rm -f /tmp/keep_current.txt /tmp/all_current.txt /tmp/delete_emergency.txt
 
 AFTER=$(ip -6 addr show eth0 2>/dev/null | grep -c "inet6.*scope global")
 
-log_msg "========== EMERGENCY CLEANUP DONE =========="
+log_msg "========== CLEANUP DONE =========="
 log_msg "Before: $BEFORE IPs"
 log_msg "After: $AFTER IPs"
-log_msg "Removed: $((BEFORE - AFTER)) IPs"
-log_msg "========================================"
+log_msg "Removed: $REMOVED IPs"
+log_msg "=============================="
 
-# Restart 3proxy if needed
 if ! pgrep 3proxy > /dev/null; then
     log_msg "3proxy not running, restarting..."
     ulimit -n 65536
@@ -345,27 +312,24 @@ create_monitor_script() {
 #!/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 
-# Auto-cleanup log
 if [ -f /home/bkns/monitor.log ]; then
     LOG_SIZE=$(du -m /home/bkns/monitor.log 2>/dev/null | cut -f1)
     [ "$LOG_SIZE" -gt 5 ] && tail -n 500 /home/bkns/monitor.log > /home/bkns/monitor.log.tmp && mv /home/bkns/monitor.log.tmp /home/bkns/monitor.log
 fi
 
-# Check 3proxy
 if ! pgrep 3proxy > /dev/null; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠️  3proxy died, restarting..." >> /home/bkns/monitor.log
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 3proxy died, restarting..." >> /home/bkns/monitor.log
     pkill -9 3proxy 2>/dev/null
     sleep 2
     ulimit -n 65536
     /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
     sleep 3
-    [ -n "$(pgrep 3proxy)" ] && echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ Restarted (PID: $(pgrep 3proxy))" >> /home/bkns/monitor.log
+    [ -n "$(pgrep 3proxy)" ] && echo "[$(date '+%Y-%m-%d %H:%M:%S')] Restarted (PID: $(pgrep 3proxy))" >> /home/bkns/monitor.log
 fi
 
-# Check IP count - trigger emergency cleanup if > 300
 IP_COUNT=$(ip -6 addr show eth0 2>/dev/null | grep -c "inet6.*scope global")
 if [ "$IP_COUNT" -gt 300 ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠️  Too many IPs ($IP_COUNT), triggering emergency cleanup" >> /home/bkns/monitor.log
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Too many IPs ($IP_COUNT), cleanup" >> /home/bkns/monitor.log
     /home/bkns/emergency_cleanup.sh >> /home/bkns/monitor.log 2>&1
 fi
 EOF
@@ -375,7 +339,6 @@ EOF
 create_log_cleanup_script() {
     cat > /home/bkns/cleanup_logs.sh << 'EOF'
 #!/bin/bash
-# Daily log cleanup
 
 for log in /home/bkns/*.log; do
     [ -f "$log" ] || continue
@@ -400,18 +363,12 @@ setup_cron_rotation() {
         echo "0 */6 * * * /home/bkns/emergency_cleanup.sh >> /home/bkns/emergency_cleanup.log 2>&1"
     ) | crontab -
     
-    echo "✅ Cron configured:"
-    echo "   - Rotation: Every 10 min (strict IP control)"
-    echo "   - Monitor: Every 3 min (auto emergency cleanup if needed)"
-    echo "   - Log cleanup: Daily 3AM"
-    echo "   - Emergency cleanup: Every 6 hours (safety net)"
+    echo "Cron configured"
 }
 
 echo "================================================================"
-echo "  3PROXY - STRICT IP CONTROL (No Accumulation)                "
-echo "  100 Ports | 10min Rotation | Always 100 IPs                 "
+echo "  3PROXY - 100 PORTS - PRECISE IP CONTROL                      "
 echo "================================================================"
-echo ""
 
 echo "[1/10] Installing dependencies..."
 install_dependencies
@@ -428,11 +385,11 @@ echo "[4/10] Detecting IPs..."
 IP4=$(curl -4 -s icanhazip.com)
 IP6=$(curl -6 -s icanhazip.com 2>/dev/null | cut -f1-4 -d':')
 
-[ -z "$IP4" ] && echo "❌ No IPv4" && exit 1
+[ -z "$IP4" ] && echo "No IPv4" && exit 1
 
 if [ -z "$IP6" ]; then
     IP6=$(ip -6 addr show eth0 2>/dev/null | grep "inet6" | grep -v "fe80" | head -1 | awk '{print $2}' | cut -f1-4 -d':')
-    [ -z "$IP6" ] && echo "❌ No IPv6" && exit 1
+    [ -z "$IP6" ] && echo "No IPv6" && exit 1
 fi
 
 echo "   IPv4: ${IP4}"
@@ -443,18 +400,18 @@ FIRST_PORT=10000
 LAST_PORT=10099
 
 gen_data > $WORKDIR/data.txt
-echo "   ✅ Ports: 10000-10099"
+echo "   Ports: 10000-10099"
 
 echo "[6/10] Adding IPv6..."
 gen_ifconfig > $WORKDIR/boot_ifconfig.sh
 chmod +x $WORKDIR/boot_ifconfig.sh
 bash $WORKDIR/boot_ifconfig.sh
-echo "   ✅ Added 100 IPs"
+echo "   Added 100 IPs"
 
 echo "[7/10] Generating config..."
 export FIXED_USER FIXED_PASS
 gen_3proxy > /usr/local/etc/3proxy/3proxy.cfg
-echo "   ✅ Config generated"
+echo "   Config generated"
 
 echo "[8/10] Setting up auto-start..."
 cat > /etc/rc.d/rc.local <<EOF
@@ -467,7 +424,7 @@ EOF
 
 chmod +x /etc/rc.d/rc.local
 systemctl enable rc-local 2>/dev/null
-echo "   ✅ Auto-start configured"
+echo "   Auto-start configured"
 
 echo "[9/10] Starting 3proxy..."
 pkill -9 3proxy 2>/dev/null
@@ -477,9 +434,9 @@ ulimit -n 65536
 sleep 3
 
 if pgrep 3proxy > /dev/null; then
-    echo "   ✅ 3proxy started (PID: $(pgrep 3proxy))"
+    echo "   3proxy started (PID: $(pgrep 3proxy))"
 else
-    echo "   ⚠️  Startup issue"
+    echo "   Startup issue"
 fi
 
 echo "[10/10] Setting up automation..."
@@ -494,72 +451,36 @@ rm -rf /root/setup.sh /root/3proxy-* 3proxy-0.8.13 2>/dev/null
 
 echo ""
 echo "================================================================"
-echo "✅ INSTALLATION COMPLETED - STRICT IP CONTROL"
+echo "INSTALLATION COMPLETED - PRECISE IP CONTROL"
 echo "================================================================"
 echo ""
-echo "📋 Config:"
+echo "Config:"
 echo "   Ports: 100 (10000-10099)"
-echo "   User/Pass: ${FIXED_USER}/${FIXED_PASS}"
+echo "   User: ${FIXED_USER}"
+echo "   Pass: ${FIXED_PASS}"
 echo "   IPv4: ${IP4}"
 echo "   IPv6: ${IP6}"
 echo ""
-echo "🛡️  STRICT IP CONTROL:"
-echo "   ✅ Always exactly 100 IPs on interface"
-echo "   ✅ Immediate cleanup after rotation"
-echo "   ✅ No IP accumulation"
-echo "   ✅ Emergency cleanup every 6h (safety)"
-echo "   ✅ Monitor triggers cleanup if > 300 IPs"
+echo "Mechanism:"
+echo "   Uses comm command for precise IP deletion"
+echo "   Always keeps exactly 100 IPs"
+echo "   Auto-fix if mismatch detected"
 echo ""
-echo "📊 Expected Usage:"
-echo "   IPs on interface: Always 100"
-echo "   RAM: ~400 MB (stable)"
-echo "   CPU: ~2-3%"
-echo "   Disconnect: 0%"
-echo ""
-echo "🔄 Automation:"
-echo "   - Rotation: Every 10 min (strict cleanup)"
-echo "   - Monitor: Every 3 min (+ auto emergency cleanup)"
-echo "   - Log cleanup: Daily 3AM"
-echo "   - Emergency cleanup: Every 6 hours"
-echo ""
-echo "📁 Files:"
+echo "Files:"
 echo "   Proxy list: $WORKDIR/proxy.txt"
 echo "   Rotation log: $WORKDIR/rotate.log"
-echo "   Emergency log: $WORKDIR/emergency_cleanup.log"
 echo ""
-echo "🧪 Test:"
+echo "Verify:"
+echo "   Proxies: wc -l /home/bkns/data.txt"
+echo "   IPs: ip -6 addr show eth0 | grep -c 'inet6.*scope global'"
+echo "   Should be equal (100)"
+echo ""
+echo "Test:"
 FIRST_PROXY=$(head -1 $WORKDIR/proxy.txt)
 if [ -n "$FIRST_PROXY" ]; then
-    echo "   curl -x ${FIXED_USER}:${FIXED_PASS}@$(echo $FIRST_PROXY | cut -d: -f1):$(echo $FIRST_PROXY | cut -d: -f2) https://api64.ipify.org"
+    PROXY_IP=$(echo $FIRST_PROXY | cut -d: -f1)
+    PROXY_PORT=$(echo $FIRST_PROXY | cut -d: -f2)
+    echo "   curl -x ${FIXED_USER}:${FIXED_PASS}@${PROXY_IP}:${PROXY_PORT} https://api64.ipify.org"
 fi
 echo ""
-echo "🔍 Monitor IP count:"
-echo "   watch -n 2 'ip -6 addr show eth0 | grep -c \"inet6.*scope global\"'"
-echo "   (Should always show ~100)"
-echo ""
 echo "================================================================"
-echo "🎉 Done! No more IP accumulation - VPS will stay stable!"
-echo "================================================================"
-echo ""
-```
-
----
-
-## 🎯 ĐẶC ĐIỂM SCRIPT MỚI:
-
-### ✅ **Strict IP Control:**
-- Luôn giữ **ĐÚNG 100 IPs** trên interface
-- Xóa ngay IPs cũ sau rotation
-- Không có grace period → Không tích lũy
-
-### ✅ **4-Layer Protection:**
-1. **Rotation:** Immediate cleanup
-2. **Monitor:** Auto cleanup nếu > 300 IPs
-3. **Emergency:** Chạy mỗi 6h
-4. **Manual:** Script `/home/bkns/emergency_cleanup.sh`
-
-### ✅ **Resource Usage:**
-```
-IPs: Always 100
-RAM: ~400 MB (stable)
-CPU: 2-3%
