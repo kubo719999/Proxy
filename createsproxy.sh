@@ -1,17 +1,25 @@
 #!/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 
+# FORCE IPv4 for all downloads
+export IPV6_DISABLE=1
+echo "ip_resolve=4" >> /etc/wgetrc 2>/dev/null
+
 FIXED_USER="AnhVip17102"
 FIXED_PASS="AnhVip17102"
 
 install_deps() {
     echo "[1/10] Installing dependencies..."
+    
+    # Force IPv4 for package managers
     if command -v yum >/dev/null 2>&1; then
-        yum install -y epel-release >/dev/null 2>&1
-        yum install -y gcc make git wget iproute vim-common ndppd >/dev/null 2>&1
+        echo "ip_resolve=4" >> /etc/yum.conf 2>/dev/null
+        yum install -y epel-release 2>&1 | grep -v "^$"
+        yum install -y gcc make git wget iproute vim-common 2>&1 | grep -v "^$"
     else
-        apt-get update >/dev/null 2>&1
-        apt-get install -y gcc make git wget iproute2 vim-common ndppd >/dev/null 2>&1
+        echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4
+        apt-get update 2>&1 | grep -v "^$"
+        apt-get install -y gcc make git wget iproute2 vim-common 2>&1 | grep -v "^$"
     fi
     echo "    Done"
 }
@@ -19,11 +27,13 @@ install_deps() {
 install_3proxy() {
     echo "[2/10] Installing 3proxy..."
     cd /root
-    wget -q https://github.com/z3APA3A/3proxy/archive/refs/tags/0.8.13.tar.gz
+    
+    # Force IPv4
+    wget -4 -q https://github.com/z3APA3A/3proxy/archive/refs/tags/0.8.13.tar.gz
     tar -xzf 0.8.13.tar.gz
     cd 3proxy-0.8.13
     make -f Makefile.Linux >/dev/null 2>&1
-    mkdir -p /usr/local/3proxy/{bin,conf}
+    mkdir -p /usr/local/3proxy/{bin,conf,logs}
     cp src/3proxy /usr/local/3proxy/bin/
     cd /root
     rm -rf 3proxy-0.8.13 0.8.13.tar.gz
@@ -38,9 +48,14 @@ detect_network() {
     IP6_PREFIX=$(echo $IP6_FULL | cut -d: -f1-4)
     
     [ -z "$IP4" ] && echo "    No IPv4" && exit 1
+    
+    if [ -z "$IP6_PREFIX" ]; then
+        IP6_PREFIX=$(ip -6 addr show eth0 | grep "inet6" | grep -v "fe80" | head -1 | awk '{print $2}' | cut -f1-4 -d':')
+    fi
+    
     [ -z "$IP6_PREFIX" ] && echo "    No IPv6" && exit 1
     
-    IFACE=$(ip -6 route get $IP6_FULL 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+    IFACE=$(ip route get 8.8.8.8 | grep -oP 'dev \K\S+')
     [ -z "$IFACE" ] && IFACE="eth0"
     
     echo "    IPv4: $IP4"
@@ -48,28 +63,15 @@ detect_network() {
     echo "    Interface: $IFACE"
 }
 
-setup_ndp_proxy() {
-    echo "[4/10] Setting up NDP proxy..."
-    
-    cat > /etc/ndppd.conf << EOF
-route-ttl 30000
-
-proxy $IFACE {
-    router yes
-    timeout 500
-    ttl 30000
-    
-    rule $IP6_PREFIX::/64 {
-        auto
-    }
-}
-EOF
-    
-    systemctl enable ndppd >/dev/null 2>&1
-    systemctl restart ndppd
+setup_ipv6_forwarding() {
+    echo "[4/10] Setting up IPv6 forwarding..."
     
     sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
-    sysctl -w net.ipv6.conf.$IFACE.proxy_ndp=1 >/dev/null 2>&1
+    sysctl -w net.ipv6.conf.$IFACE.forwarding=1 >/dev/null 2>&1
+    sysctl -w net.ipv6.conf.all.proxy_ndp=1 >/dev/null 2>&1
+    
+    # Add route for /64
+    ip -6 route add ${IP6_PREFIX}::/64 dev $IFACE 2>/dev/null
     
     echo "    Done"
 }
@@ -82,7 +84,7 @@ create_random_ip_script() {
 PREFIX=$(cat /tmp/ipv6_prefix.txt)
 
 rand_hex() {
-    echo $((RANDOM % 65536)) | awk '{printf "%04x", $1}'
+    printf "%04x" $((RANDOM % 65536))
 }
 
 echo "${PREFIX}:$(rand_hex):$(rand_hex):$(rand_hex):$(rand_hex)"
@@ -94,118 +96,125 @@ RANDEOF
     echo "    Done"
 }
 
-create_3proxy_wrapper() {
-    echo "[6/10] Creating per-port proxy wrappers..."
+create_3proxy_config() {
+    echo "[6/10] Creating 3proxy config..."
     
-    mkdir -p /usr/local/3proxy/wrappers
-    
-    for port in $(seq 10000 10049); do
-        cat > /usr/local/3proxy/wrappers/port_${port}.sh << WRAPEOF
-#!/bin/bash
-RANDOM_IP6=\$(/usr/local/3proxy/bin/random_ipv6.sh)
-
-exec /usr/local/3proxy/bin/3proxy << EOF
+    cat > /usr/local/3proxy/conf/3proxy.cfg << EOF
 daemon
-maxconn 100
+maxconn 4000
 nserver 1.1.1.1
 nserver 8.8.4.4
 timeouts 1 5 30 60 180 1800 15 60
 setgid 65535
 setuid 65535
+stacksize 6291456
+flush
 auth strong
+
 users ${FIXED_USER}:CL:${FIXED_PASS}
-log /usr/local/3proxy/logs/port_${port}.log
-logformat "- +_L%t.%. %N.%p %E %U %C:%c %R:%r %O %I %h %T"
+
+EOF
+
+    for port in $(seq 10000 10049); do
+        RANDOM_IP=$(/usr/local/3proxy/bin/random_ipv6.sh)
+        
+        # Add IP to interface
+        ip -6 addr add ${RANDOM_IP}/128 dev $IFACE 2>/dev/null
+        
+        cat >> /usr/local/3proxy/conf/3proxy.cfg << EOF
 auth strong
 allow ${FIXED_USER}
-proxy -6 -n -a -p${port} -i${IP4} -e\${RANDOM_IP6}
+proxy -6 -n -a -p${port} -i${IP4} -e${RANDOM_IP}
 flush
+
 EOF
-WRAPEOF
-        chmod +x /usr/local/3proxy/wrappers/port_${port}.sh
     done
     
     echo "    Done"
 }
 
-create_supervisor() {
-    echo "[7/10] Creating supervisor daemon..."
+create_rotation_script() {
+    echo "[7/10] Creating rotation script..."
     
-    cat > /usr/local/3proxy/bin/supervisor.sh << 'SUPEOF'
+    cat > /usr/local/3proxy/bin/rotate.sh << 'ROTEOF'
 #!/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 
-LOG="/var/log/3proxy_supervisor.log"
+IP4=$(cat /tmp/ip4.txt)
+IP6_PREFIX=$(cat /tmp/ipv6_prefix.txt)
+IFACE=$(cat /tmp/iface.txt)
 
-log_msg() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a $LOG
-}
+cat > /usr/local/3proxy/conf/3proxy.cfg << EOF
+daemon
+maxconn 4000
+nserver 1.1.1.1
+nserver 8.8.4.4
+timeouts 1 5 30 60 180 1800 15 60
+setgid 65535
+setuid 65535
+stacksize 6291456
+flush
+auth strong
 
-start_port() {
-    local port=$1
-    local wrapper="/usr/local/3proxy/wrappers/port_${port}.sh"
+users AnhVip17102:CL:AnhVip17102
+
+EOF
+
+for port in $(seq 10000 10049); do
+    rand_hex() { printf "%04x" $((RANDOM % 65536)); }
+    RANDOM_IP="${IP6_PREFIX}:$(rand_hex):$(rand_hex):$(rand_hex):$(rand_hex)"
     
-    if pgrep -f "3proxy.*-p${port}" >/dev/null; then
-        return 0
-    fi
+    ip -6 addr add ${RANDOM_IP}/128 dev $IFACE 2>/dev/null
     
-    nohup bash $wrapper >> /var/log/3proxy_port_${port}.log 2>&1 &
-    sleep 0.1
-}
+    cat >> /usr/local/3proxy/conf/3proxy.cfg << EOF
+auth strong
+allow AnhVip17102
+proxy -6 -n -a -p${port} -i${IP4} -e${RANDOM_IP}
+flush
 
-log_msg "Supervisor started"
-
-while true; do
-    for port in $(seq 10000 10049); do
-        if ! pgrep -f "3proxy.*-p${port}" >/dev/null; then
-            log_msg "Port $port down, restarting..."
-            start_port $port
-        fi
-    done
-    
-    sleep 10
+EOF
 done
-SUPEOF
+
+pkill -HUP 3proxy
+ROTEOF
     
-    chmod +x /usr/local/3proxy/bin/supervisor.sh
+    chmod +x /usr/local/3proxy/bin/rotate.sh
+    
+    echo "$IP4" > /tmp/ip4.txt
+    echo "$IFACE" > /tmp/iface.txt
     
     echo "    Done"
 }
 
 start_services() {
-    echo "[8/10] Starting services..."
-    
-    mkdir -p /usr/local/3proxy/logs
+    echo "[8/10] Starting 3proxy..."
     
     pkill -9 3proxy 2>/dev/null
-    pkill -f supervisor.sh 2>/dev/null
     sleep 2
     
-    for port in $(seq 10000 10049); do
-        bash /usr/local/3proxy/wrappers/port_${port}.sh &
-        sleep 0.05
-    done
-    
+    ulimit -n 65536
+    /usr/local/3proxy/bin/3proxy /usr/local/3proxy/conf/3proxy.cfg &
     sleep 3
     
-    RUNNING=$(pgrep -f 3proxy | wc -l)
-    echo "    Started $RUNNING instances"
-    
-    nohup /usr/local/3proxy/bin/supervisor.sh >/dev/null 2>&1 &
-    echo "    Supervisor running"
+    if pgrep 3proxy >/dev/null; then
+        echo "    3proxy running (PID: $(pgrep 3proxy))"
+    else
+        echo "    Failed to start"
+        exit 1
+    fi
 }
 
 create_autostart() {
     echo "[9/10] Setting up autostart..."
     
-    cat > /etc/systemd/system/3proxy-unlimited.service << 'SVCEOF'
+    cat > /etc/systemd/system/3proxy.service << 'SVCEOF'
 [Unit]
-Description=3proxy Unlimited IPv6
-After=network.target ndppd.service
+Description=3proxy
+After=network.target
 
 [Service]
 Type=forking
-ExecStart=/usr/local/3proxy/bin/start_all.sh
+ExecStart=/usr/local/3proxy/bin/3proxy /usr/local/3proxy/conf/3proxy.cfg
 ExecStop=/usr/bin/pkill -9 3proxy
 Restart=always
 
@@ -213,21 +222,12 @@ Restart=always
 WantedBy=multi-user.target
 SVCEOF
     
-    cat > /usr/local/3proxy/bin/start_all.sh << 'STARTEOF'
-#!/bin/bash
-for port in $(seq 10000 10049); do
-    bash /usr/local/3proxy/wrappers/port_${port}.sh &
-    sleep 0.05
-done
-
-sleep 3
-nohup /usr/local/3proxy/bin/supervisor.sh >/dev/null 2>&1 &
-STARTEOF
-    
-    chmod +x /usr/local/3proxy/bin/start_all.sh
-    
     systemctl daemon-reload
-    systemctl enable 3proxy-unlimited >/dev/null 2>&1
+    systemctl enable 3proxy >/dev/null 2>&1
+    
+    # Setup rotation cron
+    crontab -r 2>/dev/null
+    echo "*/10 * * * * /usr/local/3proxy/bin/rotate.sh" | crontab -
     
     echo "    Done"
 }
@@ -236,53 +236,45 @@ create_proxy_list() {
     echo "[10/10] Generating proxy list..."
     
     cat > /root/proxy.txt << EOF
-# 3PROXY UNLIMITED IPv6 - 50 Ports
-# Format: IP:PORT:USER:PASS
-
+# 3PROXY - 50 Ports - IPv6 Rotation every 10 min
 EOF
     
     for port in $(seq 10000 10049); do
         echo "${IP4}:${port}:${FIXED_USER}:${FIXED_PASS}" >> /root/proxy.txt
     done
     
-    echo "    List saved to /root/proxy.txt"
-}
-
-cleanup() {
-    rm -rf /root/3proxy-* /root/proxy.sh 2>/dev/null
+    echo "    Saved to /root/proxy.txt"
 }
 
 echo "=============================================="
-echo "  3PROXY UNLIMITED IPv6"
+echo "  3PROXY IPv6 ROTATION"
 echo "=============================================="
 echo ""
 
 install_deps
 install_3proxy
 detect_network
-setup_ndp_proxy
+setup_ipv6_forwarding
 create_random_ip_script
-create_3proxy_wrapper
-create_supervisor
+create_3proxy_config
+create_rotation_script
 start_services
 create_autostart
 create_proxy_list
-cleanup
+
+rm -rf /root/proxy.sh 2>/dev/null
 
 echo ""
 echo "=============================================="
-echo "INSTALLATION COMPLETE"
+echo "DONE"
 echo "=============================================="
 echo ""
-echo "Ports: 50 (10000-10049)"
-echo "Username: ${FIXED_USER}"
-echo "Password: ${FIXED_PASS}"
+echo "Ports: 10000-10049"
+echo "User: ${FIXED_USER}"
+echo "Pass: ${FIXED_PASS}"
 echo "IPv4: ${IP4}"
 echo "IPv6: ${IP6_PREFIX}::/64"
-echo ""
-echo "Proxy list: /root/proxy.txt"
-echo "Supervisor log: /var/log/3proxy_supervisor.log"
+echo "Rotation: Every 10 minutes"
 echo ""
 echo "Test: curl -x ${FIXED_USER}:${FIXED_PASS}@${IP4}:10000 https://api64.ipify.org"
 echo ""
-echo "=============================================="
