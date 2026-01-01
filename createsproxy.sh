@@ -76,7 +76,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 WORKDIR="/home/bkns"
 WORKDATA="${WORKDIR}/data.txt"
 FIRST_PORT=22000
-LAST_PORT=22049
+LAST_PORT=22099
 
 rotate_ipv6() {
     echo "[$(date)] Starting IP rotation..."
@@ -116,7 +116,7 @@ rotate_ipv6() {
         echo "$1:$(ip64):$(ip64):$(ip64):$(ip64)"
     }
     
-    # Tạo data.txt mới với 50 port
+    # Tạo data.txt mới với 100 port
     echo "[$(date)] Generating new proxy data..."
     > ${WORKDATA}.new
     for port in $(seq $FIRST_PORT $LAST_PORT); do
@@ -128,7 +128,7 @@ rotate_ipv6() {
     chmod +x ${WORKDIR}/boot_ifconfig.sh.new
     
     # Apply IPv6 addresses mới
-    echo "[$(date)] Adding 50 new IPv6 addresses..."
+    echo "[$(date)] Adding 100 new IPv6 addresses..."
     bash ${WORKDIR}/boot_ifconfig.sh.new 2>&1 | grep -v "File exists"
     
     # Chờ network ổn định
@@ -136,7 +136,7 @@ rotate_ipv6() {
     
     # Verify số lượng IPv6 đã add
     IPV6_COUNT=$(ip -6 addr show dev eth0 | grep 'inet6 2' | grep -v fe80 | wc -l)
-    echo "[$(date)] IPv6 addresses added: $IPV6_COUNT/50"
+    echo "[$(date)] IPv6 addresses added: $IPV6_COUNT/100"
     
     # Regenerate 3proxy config với data mới
     echo "[$(date)] Regenerating 3proxy config..."
@@ -237,9 +237,9 @@ fi
 
 echo "Internal IP = ${IP4}. External sub for IP6 = ${IP6}"
 
-# Chỉ 50 port: từ 22000 đến 22049
+# 100 port: từ 22000 đến 22099
 FIRST_PORT=22000
-LAST_PORT=22049
+LAST_PORT=22099
 
 gen_data >$WORKDIR/data.txt
 gen_ifconfig >$WORKDIR/boot_ifconfig.sh
@@ -273,8 +273,8 @@ echo ""
 echo "=========================================="
 echo "✓ Proxy Setup Completed!"
 echo "=========================================="
-echo "Total Proxies: 50"
-echo "Port Range: 22000-22049"
+echo "Total Proxies: 100"
+echo "Port Range: 22000-22099"
 echo "Username: AnhVip17102"
 echo "Password: AnhVip17102"
 echo "IP Rotation: Every 10 minutes"
