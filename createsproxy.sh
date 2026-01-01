@@ -1,100 +1,80 @@
-# Xóa rotation.log cũ để dễ theo dõi
-> /home/bkns/rotation.log
-
-# Tạo lại script rotate_ip.sh HOÀN TOÀN MỚI
-cat > /home/bkns/rotate_ip.sh << 'EOFSCRIPT'
 #!/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+exec >> /home/bkns/rotation.log 2>&1
+
 WORKDIR="/home/bkns"
 WORKDATA="${WORKDIR}/data.txt"
+IFACE="eth0"
+
+USER="AnhVip17102"
+PASS="AnhVip17102"
+
 FIRST_PORT=22000
 LAST_PORT=22049
+TOTAL_PORT=50
 
-rotate_ipv6() {
-    echo "[$(date)] Starting IP rotation..."
-    
-    # Xóa IPv6 cũ
-    echo "[$(date)] Removing old IPv6 addresses..."
-    for addr in $(ip -6 addr show dev eth0 | grep -E 'inet6 2403' | awk '{print $2}'); do
-        ip -6 addr del $addr dev eth0 2>/dev/null
-    done
-    
-    sleep 1
-    
-    # Lấy IPv6 prefix
-    IP6=$(ip -6 route show default | awk '{print $3}' | cut -f1-4 -d':')
-    IP4=$(curl -4 -s --max-time 5 icanhazip.com 2>/dev/null)
-    [ -z "$IP4" ] && IP4=$(ip -4 addr show eth0 | grep inet | awk '{print $2}' | cut -d'/' -f1)
-    
-    if [ -z "$IP6" ] || [ -z "$IP4" ]; then
-        echo "[$(date)] ERROR: IP6='$IP6', IP4='$IP4'"
-        return 1
-    fi
-    
-    echo "[$(date)] IPv6: $IP6 | IPv4: $IP4"
-    
-    # Generate IPv6
-    array=(1 2 3 4 5 6 7 8 9 0 a b c d e f)
-    gen64() {
-        ip64() { echo "${array[$RANDOM % 16]}${array[$RANDOM % 16]}${array[$RANDOM % 16]}${array[$RANDOM % 16]}"; }
-        echo "$1:$(ip64):$(ip64):$(ip64):$(ip64)"
-    }
-    
-    # Tạo data mới
-    echo "[$(date)] Generating 50 proxies..."
-    > ${WORKDATA}.new
-    for port in $(seq $FIRST_PORT $LAST_PORT); do
-        echo "AnhVip17102/AnhVip17102/$IP4/$port/$(gen64 $IP6)" >> ${WORKDATA}.new
-    done
-    
-    # Add IPv6
-    echo "[$(date)] Adding IPv6 addresses..."
-    awk -F "/" '{print "ip -6 addr add " $5 "/64 dev eth0 2>/dev/null"}' ${WORKDATA}.new | bash
-    sleep 2
-    
-    IPV6_COUNT=$(ip -6 addr show dev eth0 | grep 2403 | wc -l)
-    echo "[$(date)] IPv6 added: $IPV6_COUNT/50"
-    
-    # Config 3proxy
-    echo "[$(date)] Updating 3proxy config..."
-    cat > /usr/local/etc/3proxy/3proxy.cfg <<EOFCONFIG
-daemon
-maxconn 2000
-nserver 1.1.1.1
-nserver 8.8.4.4
-timeouts 1 5 30 60 180 1800 15 60
-setgid 65535
-setuid 65535
-stacksize 6291456 
-flush
-auth strong
-users $(awk -F "/" 'BEGIN{ORS="";} {print $1 ":CL:" $2 " "}' ${WORKDATA}.new)
-$(awk -F "/" '{print "auth strong\nallow " $1 "\nproxy -6 -n -a -p" $4 " -i" $3 " -e"$5"\nflush"}' ${WORKDATA}.new)
-EOFCONFIG
-    
-    mv ${WORKDATA}.new ${WORKDATA}
-    awk -F "/" '{print $3 ":" $4 ":" $1 ":" $2}' ${WORKDATA} > ${WORKDIR}/proxy.txt
-    
-    # Restart 3proxy
-    echo "[$(date)] Restarting 3proxy..."
-    pkill -9 3proxy 2>/dev/null
-    sleep 1
-    ulimit -n 10048
-    /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg
-    sleep 2
-    
-    if pgrep 3proxy >/dev/null; then
-        echo "[$(date)] ✓ SUCCESS! IPv6: $IPV6_COUNT"
-    else
-        echo "[$(date)] ✗ FAILED! 3proxy not running"
-        return 1
-    fi
+echo "[$(date)] ===== ROTATE START ====="
+
+# 1️⃣ XÓA TOÀN BỘ IPv6 GLOBAL CŨ (TRÁNH NGẼN & TRÀN RAM)
+echo "[$(date)] Removing old IPv6..."
+ip -6 addr show dev $IFACE scope global | awk '/inet6/ {print $2}' | while read ip; do
+    ip -6 addr del $ip dev $IFACE 2>/dev/null
+done
+sleep 1
+
+# 2️⃣ LẤY IPv6 PREFIX CHUẨN
+IP6_PREFIX=$(ip -6 addr show dev $IFACE scope global | awk '/inet6/ {print $2}' | head -n1 | cut -d'/' -f1 | cut -f1-4 -d':')
+IP4=$(curl -4 -s --max-time 5 icanhazip.com)
+[ -z "$IP4" ] && IP4=$(ip -4 addr show $IFACE | awk '/inet /{print $2}' | cut -d/ -f1)
+
+if [[ -z "$IP6_PREFIX" || -z "$IP4" ]]; then
+    echo "[$(date)] ❌ ERROR: IP PREFIX FAIL"
+    exit 1
+fi
+
+echo "[$(date)] IPv4: $IP4 | IPv6 Prefix: $IP6_PREFIX"
+
+# 3️⃣ HÀM RANDOM IPv6
+gen_ipv6() {
+    printf "%s:%04x:%04x:%04x:%04x\n" "$IP6_PREFIX" $RANDOM $RANDOM $RANDOM $RANDOM
 }
 
-rotate_ipv6
-EOFSCRIPT
+# 4️⃣ TẠO DATA 50 PORT CỐ ĐỊNH
+> ${WORKDATA}.new
+for port in $(seq $FIRST_PORT $LAST_PORT); do
+    IPV6=$(gen_ipv6)
+    echo "$USER/$PASS/$IP4/$port/$IPV6" >> ${WORKDATA}.new
+    ip -6 addr add $IPV6/64 dev $IFACE 2>/dev/null
+done
 
-chmod +x /home/bkns/rotate_ip.sh
+sleep 2
 
-# Test ngay
-echo "=== TESTING SCRIPT ===" && bash /home/bkns/rotate_ip.sh
+COUNT=$(ip -6 addr show dev $IFACE scope global | wc -l)
+echo "[$(date)] IPv6 added: $COUNT / $TOTAL_PORT"
+
+# 5️⃣ GHI FILE 3PROXY (PORT GIỮ NGUYÊN → KHÔNG DIE)
+echo "[$(date)] Writing 3proxy config..."
+{
+echo "daemon"
+echo "maxconn 2000"
+echo "nserver 1.1.1.1"
+echo "nserver 8.8.4.4"
+echo "timeouts 1 5 30 60 180 1800 15 60"
+echo "auth strong"
+echo "users $USER:CL:$PASS"
+
+awk -F "/" '{print "allow " $1 "\nproxy -6 -n -a -p" $4 " -i" $3 " -e"$5 "\nflush"}' ${WORKDATA}.new
+} > /usr/local/etc/3proxy/3proxy.cfg
+
+mv ${WORKDATA}.new ${WORKDATA}
+awk -F "/" '{print $3 ":" $4 ":" $1 ":" $2}' ${WORKDATA} > ${WORKDIR}/proxy.txt
+
+# 6️⃣ RESTART 3PROXY AN TOÀN (KHÔNG -9)
+echo "[$(date)] Restarting 3proxy..."
+pkill 3proxy 2>/dev/null
+sleep 2
+ulimit -n 10048
+/usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg
+
+sleep 2
+pgrep 3proxy && echo "[$(date)] ✅ ROTATE SUCCESS" || echo "[$(date)] ❌ ROTATE FAIL"
