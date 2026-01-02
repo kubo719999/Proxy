@@ -1,6 +1,11 @@
 #!/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 
+random() {
+    tr </dev/urandom -dc A-Za-z0-9 | head -c5
+    echo
+}
+
 array=(1 2 3 4 5 6 7 8 9 0 a b c d e f)
 gen64() {
     ip64() {
@@ -34,27 +39,32 @@ setgid 65535
 setuid 65535
 stacksize 6291456 
 flush
+auth strong
 
-$(awk -F "/" '{print "proxy -6 -n -a -p" $3 " -i" $2 " -e"$4"\n" \
+users $(awk -F "/" 'BEGIN{ORS="";} {print $1 ":CL:" $2 " "}' ${WORKDATA})
+
+$(awk -F "/" '{print "auth strong\n" \
+"allow " $1 "\n" \
+"proxy -6 -n -a -p" $4 " -i" $3 " -e"$5"\n" \
 "flush\n"}' ${WORKDATA})
 EOF
 }
 
 gen_proxy_file_for_user() {
     cat >proxy.txt <<EOF
-$(awk -F "/" '{print $2 ":" $3}' ${WORKDATA})
+$(awk -F "/" '{print $3 ":" $4 ":" $1 ":" $2 }' ${WORKDATA})
 EOF
 }
 
 gen_data() {
     seq $FIRST_PORT $LAST_PORT | while read port; do
-        echo "noauth/$IP4/$port/$(gen64 $IP6)"
+        echo "AnhVip17102/AnhVip17102/$IP4/$port/$(gen64 $IP6)"
     done
 }
 
 gen_ifconfig() {
     cat <<EOF
-$(awk -F "/" '{print "ifconfig eth0 inet6 add " $4 "/64"}' ${WORKDATA})
+$(awk -F "/" '{print "ifconfig eth0 inet6 add " $5 "/64"}' ${WORKDATA})
 EOF
 }
 
@@ -72,16 +82,8 @@ IP6=$(curl -6 -s icanhazip.com | cut -f1-4 -d':')
 
 echo "Internal IP = ${IP4}. External sub for IP6 = ${IP6}"
 
-# Random port range trong IANA Dynamic/Private range (49152-64535)
-# Đảm bảo có đủ 1000 ports liên tục
-MAX_START_PORT=63536  # 64535 - 999 = 63536
-RANDOM_START=$((RANDOM % (MAX_START_PORT - 49152 + 1) + 49152))
-FIRST_PORT=$RANDOM_START
-LAST_PORT=$((FIRST_PORT + 999))
-
-echo "========================================"
-echo "Random Port Range Selected"
-echo "========================================"
+FIRST_PORT=22000
+LAST_PORT=22700
 
 gen_data >$WORKDIR/data.txt
 gen_ifconfig >$WORKDIR/boot_ifconfig.sh
@@ -102,25 +104,7 @@ systemctl start rc-local
 bash /etc/rc.local
 
 gen_proxy_file_for_user
-
-# Lưu port range để sau này còn biết
-echo "$FIRST_PORT-$LAST_PORT" > $WORKDIR/port_range.txt
-
 rm -rf /root/setup.sh
 rm -rf /root/3proxy-3proxy-0.8.6
 
-echo "========================================"
-echo "✅ Proxy Setup Complete!"
-echo "========================================"
-echo "Mode: No Authentication"
-echo "Port range: $FIRST_PORT-$LAST_PORT (1000 ports)"
-echo "Scan probability: ~2-5% (Random Dynamic range)"
-echo "Proxy list: ${WORKDIR}/proxy.txt"
-echo "Port range saved: ${WORKDIR}/port_range.txt"
-echo "========================================"
-echo ""
-echo "Example proxy format in proxy.txt:"
-echo "$IP4:$FIRST_PORT"
-echo "$IP4:$((FIRST_PORT + 1))"
-echo "..."
-echo "========================================"
+echo "Starting Proxy"
